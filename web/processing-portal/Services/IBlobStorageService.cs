@@ -1,8 +1,19 @@
+using System.Collections.Generic;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+
 namespace ProcessingPortal.Services;
 
 public interface IBlobStorageService
 {
-    Task UploadToInputAsync(string fileName, Stream content, string contentType, CancellationToken cancellationToken = default);
+    Task UploadToInputAsync(
+        string fileName,
+        Stream content,
+        string contentType,
+        string referenceId,
+        IReadOnlyList<string> workflowSteps,
+        CancellationToken cancellationToken = default);
     Task<IReadOnlyList<BlobItemModel>> ListInputBlobsAsync(CancellationToken cancellationToken = default);
     Task<IReadOnlyList<BlobItemModel>> ListOutputBlobsAsync(CancellationToken cancellationToken = default);
     Task<(Stream Content, string ContentType)> OpenOutputBlobAsync(string blobName, CancellationToken cancellationToken = default);

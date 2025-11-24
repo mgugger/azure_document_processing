@@ -46,6 +46,119 @@
     background: rgba(255, 255, 255, 0.02);
 }
 
+.upload-form {
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 14px;
+    padding: 1.25rem;
+}
+
+.form-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    font-size: 0.9rem;
+    color: #cbd5f5;
+}
+
+.form-field input[type="text"] {
+    background: rgba(15, 23, 42, 0.6);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 10px;
+    padding: 0.65rem 0.9rem;
+    color: #f8fafc;
+    font-size: 1rem;
+}
+
+.form-field input[type="text"]:focus {
+    outline: none;
+    border-color: #818cf8;
+    box-shadow: 0 0 0 1px rgba(129, 140, 248, 0.4);
+}
+
+.workflow-builder {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 1rem;
+}
+
+.workflow-options ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.workflow-options li {
+    background: rgba(15, 23, 42, 0.7);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 12px;
+    padding: 0.75rem;
+}
+
+.workflow-options input[type="checkbox"] {
+    margin-right: 0.5rem;
+}
+
+.workflow-label {
+    font-weight: 600;
+    color: #e0e7ff;
+}
+
+.workflow-description {
+    margin: 0.35rem 0 0;
+    font-size: 0.85rem;
+    color: #94a3b8;
+}
+
+.workflow-order ol {
+    margin: 0.5rem 0 0;
+    padding-left: 1.25rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+}
+
+.workflow-order li {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    background: rgba(15, 23, 42, 0.7);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 10px;
+    padding: 0.6rem 0.75rem;
+}
+
+.order-controls {
+    display: flex;
+    gap: 0.35rem;
+}
+
+.order-controls button {
+    border: 1px solid rgba(148, 163, 184, 0.4);
+    background: transparent;
+    color: #cbd5f5;
+    border-radius: 8px;
+    padding: 0.2rem 0.5rem;
+    cursor: pointer;
+}
+
+.order-controls button.remove {
+    border-color: rgba(248, 113, 113, 0.5);
+    color: #fecaca;
+}
+
+.order-controls button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
 .refresh {
     background: #4338ca;
     border: none;

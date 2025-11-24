@@ -12,6 +12,7 @@ param storageAccountDataOwnerRoleId string = 'b7e6dc6d-f1e8-4753-8033-0f276bb095
 param storageAccountTableDataContributorRoleId string = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
 param storageAccountContributorRoleId string = '17d1049b-9a84-46fb-8f53-869881c3d3ab'
 param storageQueueMessageProcessorRoleId string = '974c5e8b-45b9-4653-ba55-5f855dd0fb88'
+param storageQueueDataContributorRoleId string = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
 param cognitiveServicesContributorRoleId string = '25fbc0a9-bd7c-42a3-aa1a-3b75d497ee68'
 param cognitiveServicesUserRoleId string = 'a97b65f3-24c7-4388-baec-2e87135dc908'
 param storageBlobDataReaderRoleId string = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'

@@ -18,6 +18,65 @@
             <p>Select up to 5 files (max 200 MB each) to push into the input container.</p>
         </header>
 
+        <div class="upload-form">
+            <label class="form-field" for="referenceId">
+                <span>Reference ID <sup>*</sup></span>
+                <input id="referenceId"
+                       type="text"
+                       placeholder="e.g., CLAIM-2025-0001"
+                       @bind="_referenceId"
+                       @bind:event="oninput"
+                       autocomplete="off"
+                       spellcheck="false" />
+                <small>Every file in this batch will be tagged with this user-supplied identifier.</small>
+            </label>
+
+            <div class="workflow-builder">
+                <div class="workflow-options">
+                    <h3>Workflow Steps</h3>
+                    <p>Select the processors to run and define their order.</p>
+                    <ul>
+                        @foreach (var step in _availableWorkflowSteps)
+                        {
+                            <li>
+                                <label>
+                                    <input type="checkbox"
+                                           checked="@IsWorkflowStepSelected(step.Key)"
+                                           @onchange="args => HandleWorkflowSelectionChanged(step.Key, args)" />
+                                    <span class="workflow-label">@step.Label</span>
+                                </label>
+                                <p class="workflow-description">@step.Description</p>
+                            </li>
+                        }
+                    </ul>
+                </div>
+                <div class="workflow-order">
+                    <h4>Execution Order</h4>
+                    @if (_selectedWorkflowSteps.Count == 0)
+                    {
+                        <p>No steps selected yet.</p>
+                    }
+                    else
+                    {
+                        <ol>
+                            @for (var i = 0; i < _selectedWorkflowSteps.Count; i++)
+                            {
+                                var stepKey = _selectedWorkflowSteps[i];
+                                <li>
+                                    <span>@GetWorkflowStepLabel(stepKey)</span>
+                                    <div class="order-controls">
+                                        <button type="button" @onclick="() => MoveWorkflowStep(stepKey, -1)" disabled="@(i == 0)">↑</button>
+                                        <button type="button" @onclick="() => MoveWorkflowStep(stepKey, 1)" disabled="@(i == _selectedWorkflowSteps.Count - 1)">↓</button>
+                                        <button type="button" class="remove" @onclick="() => RemoveWorkflowStep(stepKey)">Remove</button>
+                                    </div>
+                                </li>
+                            }
+                        </ol>
+                    }
+                </div>
+            </div>
+        </div>
+
         <div class="upload-drop">
             <Microsoft.AspNetCore.Components.Forms.InputFile OnChange="HandleUploadAsync" Multiple="true" accept=".pdf,.jpg,.jpeg,.png,.tiff,.docx,.pptx,.txt" disabled="@_isUploading" />
             <p>Drag and drop or click to browse.</p>
@@ -220,6 +279,16 @@
     private bool _previewModalIsText;
     private string? _previewModalTextContent;
     private readonly HashSet<string> _deletingBlobs = new(StringComparer.Ordinal);
+    private string _referenceId = string.Empty;
+    private readonly List<string> _selectedWorkflowSteps = new();
+    private readonly WorkflowStepOption[] _availableWorkflowSteps =
+    {
+        new("docintelligence", "Document Intelligence", "Extracts text and layout using Azure Document Intelligence."),
+        new("pii", "PII Detection", "Redacts sensitive entities after Document Intelligence completes."),
+        new("translation", "Translation / Text", "Auto-detects language and translates to English if needed."),
+        new("aivision", "AI Vision", "Captures object/tag metadata for images."),
+        new("gptvision", "GPT Vision", "Generates insurance-ready descriptions via GPT-4o."),
+    };
 
     protected override async Task OnInitializedAsync()
     {
@@ -234,6 +303,20 @@
             return;
         }
 
+        var trimmedReferenceId = _referenceId?.Trim();
+        if (string.IsNullOrWhiteSpace(trimmedReferenceId))
+        {
+            _uploadError = "Reference ID is required before uploading.";
+            return;
+        }
+
+        var normalizedSteps = BuildNormalizedWorkflowSteps();
+        if (normalizedSteps.Count == 0)
+        {
+            _uploadError = "Select at least one workflow step.";
+            return;
+        }
+
         _isUploading = true;
         _uploadStatus = null;
         _uploadError = null;
@@ -243,7 +326,12 @@
             foreach (var file in files)
             {
                 await using var fileStream = file.OpenReadStream(MaxFileSize);
-                await StorageService.UploadToInputAsync(file.Name, fileStream, file.ContentType ?? "application/octet-stream");
+                await StorageService.UploadToInputAsync(
+                    file.Name,
+                    fileStream,
+                    file.ContentType ?? "application/octet-stream",
+                    trimmedReferenceId!,
+                    normalizedSteps);
             }
 
             _uploadStatus = files.Count == 1
@@ -372,6 +460,111 @@
     {
         _previewFrameLoading = false;
         StateHasChanged();
+    }
+
+    private void HandleWorkflowSelectionChanged(string key, ChangeEventArgs args)
+    {
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            return;
+        }
+
+        var shouldInclude = args.Value switch
+        {
+            bool b => b,
+            string s when string.Equals(s, "true", StringComparison.OrdinalIgnoreCase) => true,
+            string s when string.Equals(s, "on", StringComparison.OrdinalIgnoreCase) => true,
+            string s when bool.TryParse(s, out var parsed) => parsed,
+            _ => false
+        };
+
+        if (shouldInclude)
+        {
+            AddWorkflowStep(key);
+        }
+        else
+        {
+            RemoveWorkflowStep(key);
+        }
+    }
+
+    private void AddWorkflowStep(string key)
+    {
+        var normalized = NormalizeWorkflowStepKey(key);
+        if (string.IsNullOrWhiteSpace(normalized) || IsWorkflowStepSelected(normalized))
+        {
+            return;
+        }
+
+        _selectedWorkflowSteps.Add(normalized);
+    }
+
+    private void RemoveWorkflowStep(string key)
+    {
+        var index = FindWorkflowStepIndex(key);
+        if (index >= 0)
+        {
+            _selectedWorkflowSteps.RemoveAt(index);
+        }
+    }
+
+    private bool IsWorkflowStepSelected(string key) => FindWorkflowStepIndex(key) >= 0;
+
+    private void MoveWorkflowStep(string key, int offset)
+    {
+        if (offset == 0 || _selectedWorkflowSteps.Count == 0)
+        {
+            return;
+        }
+
+        var index = FindWorkflowStepIndex(key);
+        if (index < 0)
+        {
+            return;
+        }
+
+        var newIndex = Math.Clamp(index + offset, 0, _selectedWorkflowSteps.Count - 1);
+        if (newIndex == index)
+        {
+            return;
+        }
+
+        var step = _selectedWorkflowSteps[index];
+        _selectedWorkflowSteps.RemoveAt(index);
+        _selectedWorkflowSteps.Insert(newIndex, step);
+    }
+
+    private int FindWorkflowStepIndex(string key)
+    {
+        var normalized = NormalizeWorkflowStepKey(key);
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return -1;
+        }
+
+        return _selectedWorkflowSteps.FindIndex(step => string.Equals(step, normalized, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private string GetWorkflowStepLabel(string key)
+    {
+        var normalized = NormalizeWorkflowStepKey(key);
+        var option = _availableWorkflowSteps.FirstOrDefault(step => string.Equals(step.Key, normalized, StringComparison.OrdinalIgnoreCase));
+        return option?.Label ?? normalized;
+    }
+
+    private List<string> BuildNormalizedWorkflowSteps()
+    {
+        return _selectedWorkflowSteps
+            .Select(NormalizeWorkflowStepKey)
+            .Where(step => !string.IsNullOrWhiteSpace(step))
+            .ToList();
+    }
+
+    private static string NormalizeWorkflowStepKey(string key)
+    {
+        return string.IsNullOrWhiteSpace(key)
+            ? string.Empty
+            : key.Trim().ToLowerInvariant();
     }
 
     private static readonly IReadOnlyList<string> PreferredContentFields = new[] { "main_content", "content" };
@@ -616,4 +809,6 @@
             || extension.Equals(".xml", StringComparison.OrdinalIgnoreCase)
             || extension.Equals(".log", StringComparison.OrdinalIgnoreCase);
     }
+
+    private sealed record WorkflowStepOption(string Key, string Label, string Description);
 }

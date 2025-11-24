@@ -1,24 +1,29 @@
-using Azure.Storage.Queues;
-using System.Text.Json;
-
 using System;
-using System.Threading.Tasks;
-using Microsoft.Azure.Functions.Worker;
-using Microsoft.Extensions.Logging;
-using Azure.AI.FormRecognizer.DocumentAnalysis;
-using Azure.Identity;
-using Azure.Storage.Blobs;
-using Azure.AI.Vision.ImageAnalysis;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Collections.Generic;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using Azure;
+using Azure.AI.FormRecognizer.DocumentAnalysis;
 using Azure.AI.OpenAI;
-using OpenAI;
+using Azure.AI.TextAnalytics;
+using Azure.AI.Translation.Text;
+using Azure.AI.Vision.ImageAnalysis;
+using Azure.Identity;
+using Azure.Messaging.EventGrid;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
+using Azure.Storage.Queues;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Extensions.Logging;
 using OpenAI.Chat;
 
 namespace InboundProcess
 {
-    public class BlobCreatedEventData
+    public sealed class BlobCreatedEventData
     {
         public string api { get; set; }
         public string requestId { get; set; }
@@ -32,194 +37,332 @@ namespace InboundProcess
         public StorageDiagnostics storageDiagnostics { get; set; }
     }
 
-    public class StorageDiagnostics
+    public sealed class StorageDiagnostics
     {
         public string batchId { get; set; }
     }
 
-        public class OperationQueueMessage
+    public sealed class DocumentIntelligenceQueueMessage
     {
-        public string operationId { get; set; }
-        public string blobUrl { get; set; }
+        public string OperationId { get; set; }
+        public string BlobUrl { get; set; }
+        public WorkflowEnvelope Workflow { get; set; }
+    }
+
+    public sealed class WorkflowEnvelope
+    {
+        public string ReferenceId { get; set; }
+        public string BlobPath { get; set; }
+        public string CurrentStep { get; set; }
+        public List<string> RemainingSteps { get; set; } = new();
+        public IDictionary<string, string> Metadata { get; set; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        public WorkflowFailure Failure { get; set; }
+    }
+
+    public sealed class WorkflowFailure
+    {
+        public string Step { get; set; }
+        public string Error { get; set; }
+        public DateTimeOffset Timestamp { get; set; }
+    }
+
+    public sealed class WorkflowAlertMessage
+    {
+        public string ReferenceId { get; set; }
+        public string BlobPath { get; set; }
+        public string FailedStep { get; set; }
+        public string Error { get; set; }
+        public DateTimeOffset Timestamp { get; set; }
     }
 
     public class InboundProcessFunctions
     {
         private readonly ILogger _logger;
+        private readonly BlobServiceClient _blobServiceClient;
+        private readonly QueueServiceClient _queueServiceClient;
+        private readonly IReadOnlyDictionary<string, string> _workflowQueues;
+        private readonly string _alertQueueName;
+        private readonly JsonSerializerOptions _camelCaseOptions = new()
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            WriteIndented = false
+        };
+
+        private const string ReferenceIdMetadataKey = "reference_id";
+        private const string WorkflowStepsMetadataKey = "workflow_steps";
+        private const string InputContainerName = "input";
+        private const string OutputContainerName = "output";
 
         public InboundProcessFunctions(ILoggerFactory loggerFactory)
         {
             _logger = loggerFactory.CreateLogger<InboundProcessFunctions>();
+            _blobServiceClient = CreateBlobServiceClient();
+            _queueServiceClient = CreateQueueServiceClient();
+            _workflowQueues = LoadWorkflowQueueMap();
+            _alertQueueName = Environment.GetEnvironmentVariable("WORKFLOW_ALERT_QUEUE")?.Trim() ?? "workflow-alerts";
         }
 
         [Function("BlobCreatedEventGridFunction")]
-        public async Task Run(
-            [EventGridTrigger] Azure.Messaging.EventGrid.EventGridEvent eventGridEvent,
+        public async Task HandleBlobCreatedAsync(
+            [EventGridTrigger] EventGridEvent eventGridEvent,
             FunctionContext context)
         {
-            _logger.LogInformation($"EventGrid event received: {eventGridEvent.EventType}\nRaw Data: {eventGridEvent.Data}");
-
-            if (eventGridEvent.EventType == "Microsoft.Storage.BlobCreated")
+            var cancellationToken = context.CancellationToken;
+            if (!string.Equals(eventGridEvent.EventType, "Microsoft.Storage.BlobCreated", StringComparison.OrdinalIgnoreCase))
             {
-                var data = eventGridEvent.Data.ToObjectFromJson<BlobCreatedEventData>();
-                string url = data?.url;
-                _logger.LogInformation($"Blob created at URL: {url}");
-
-                if (!string.IsNullOrEmpty(url) && url.Contains("/input/"))
-                {
-                    _logger.LogInformation($"New file uploaded to 'input' container: {url}");
-                    string blob_endpoint = Environment.GetEnvironmentVariable("AzureWebJobsStorage__blobServiceUri");
-
-                    var blobUri = new Uri(url);
-                    var segments = blobUri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-
-                    var containerName = segments[0];
-                    var blobName = string.Join('/', segments, 1, segments.Length - 1);
-                    var blobServiceClient = new Azure.Storage.Blobs.BlobServiceClient(new Uri(blob_endpoint), new DefaultAzureCredential());
-                    var blobClient = blobServiceClient.GetBlobContainerClient(containerName).GetBlobClient(blobName);
-
-                    if (blobName.EndsWith(".txt"))
-                    {
-                        // for text
-                        await CheckAndTranslateIfNecessary(url, blobClient);
-                    }
-                    if (blobName.EndsWith(".pdf"))
-                    {
-                        await RunDocumentIntelligence(url, blobClient);
-                    }
-                    else if (blobName.StartsWith("email_"))
-                    {
-                        await RunAIVision(url, blobClient);
-                        await RunGPTVision(url, blobClient);
-                    }
-                }
-                else
-                {
-                    _logger.LogInformation($"Blob is not in the 'input' container, ignoring: {url}");
-                }
+                _logger.LogInformation("Ignoring event type {EventType}", eventGridEvent.EventType);
+                return;
             }
-            else
+
+            var data = eventGridEvent.Data.ToObjectFromJson<BlobCreatedEventData>();
+            var url = data?.url;
+            if (string.IsNullOrWhiteSpace(url))
             {
-                _logger.LogInformation($"Event type is not BlobCreated, ignoring.");
+                _logger.LogWarning("BlobCreated event missing url payload");
+                return;
             }
+
+            var blobUri = new Uri(url);
+            var segments = blobUri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            if (segments.Length < 2)
+            {
+                _logger.LogWarning("Blob URI missing container or blob path: {Url}", url);
+                return;
+            }
+
+            var containerName = segments[0];
+            if (!string.Equals(containerName, InputContainerName, StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogInformation("Blob {Url} not in monitored container", url);
+                return;
+            }
+
+            var blobName = string.Join('/', segments.Skip(1));
+            var blobPath = $"{InputContainerName}/{blobName}";
+            _logger.LogInformation("Scheduling workflow for blob {BlobPath}", blobPath);
+
+            var blobClient = _blobServiceClient.GetBlobContainerClient(InputContainerName).GetBlobClient(blobName);
+
+            Dictionary<string, string> metadata;
+            try
+            {
+                metadata = await ReadBlobMetadataAsync(blobClient, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to read blob metadata for {BlobPath}", blobPath);
+                await PublishAlertAsync(blobPath, null, $"Failed to read blob metadata: {ex.Message}", cancellationToken);
+                return;
+            }
+
+            var referenceId = ResolveReferenceId(metadata);
+            if (string.IsNullOrWhiteSpace(referenceId))
+            {
+                await PublishAlertAsync(blobPath, null, "Blob missing reference_id metadata", cancellationToken);
+                _logger.LogWarning("Blob {BlobPath} missing required reference_id", blobPath);
+                return;
+            }
+
+            var workflowSteps = ResolveWorkflowSteps(metadata);
+            if (workflowSteps.Count == 0)
+            {
+                await PublishAlertAsync(blobPath, referenceId, "Workflow steps missing", cancellationToken);
+                _logger.LogWarning("Blob {BlobPath} missing workflow steps metadata", blobPath);
+                return;
+            }
+
+            var envelope = new WorkflowEnvelope
+            {
+                ReferenceId = referenceId,
+                BlobPath = blobPath,
+                CurrentStep = workflowSteps[0],
+                RemainingSteps = workflowSteps.Skip(1).ToList(),
+                Metadata = metadata
+            };
+
+            await EnqueueWorkflowAsync(envelope, cancellationToken);
         }
 
-        private async Task RunGPTVision(string url, BlobClient blobClient)
+        [Function("WorkflowDocIntelligenceStep")]
+        public async Task WorkflowDocIntelligenceStep(
+            [QueueTrigger("%WORKFLOW_QUEUE_DOCINTELLIGENCE%", Connection = "AzureWebJobsStorage")] string message,
+            FunctionContext context) =>
+            await ExecuteWorkflowStepAsync("docintelligence", message, context, RunDocumentIntelligenceStepAsync);
+
+        [Function("WorkflowTranslationStep")]
+        public async Task WorkflowTranslationStep(
+            [QueueTrigger("%WORKFLOW_QUEUE_TRANSLATION%", Connection = "AzureWebJobsStorage")] string message,
+            FunctionContext context) =>
+            await ExecuteWorkflowStepAsync("translation", message, context, RunTranslationStepAsync);
+
+        [Function("WorkflowPiiStep")]
+        public async Task WorkflowPiiStep(
+            [QueueTrigger("%WORKFLOW_QUEUE_PII%", Connection = "AzureWebJobsStorage")] string message,
+            FunctionContext context) =>
+            await ExecuteWorkflowStepAsync("pii", message, context, RunPiiStepAsync);
+
+        [Function("WorkflowAIVisionStep")]
+        public async Task WorkflowAIVisionStep(
+            [QueueTrigger("%WORKFLOW_QUEUE_AIVISION%", Connection = "AzureWebJobsStorage")] string message,
+            FunctionContext context) =>
+            await ExecuteWorkflowStepAsync("aivision", message, context, RunAIVisionStepAsync);
+
+        [Function("WorkflowGptVisionStep")]
+        public async Task WorkflowGptVisionStep(
+            [QueueTrigger("%WORKFLOW_QUEUE_GPTVISION%", Connection = "AzureWebJobsStorage")] string message,
+            FunctionContext context) =>
+            await ExecuteWorkflowStepAsync("gptvision", message, context, RunGptVisionStepAsync);
+
+        [Function("ProcessDocumentIntelligenceResult")]
+        public async Task ProcessDocumentIntelligenceResult(
+            [QueueTrigger("%OPERATION_QUEUE_NAME%", Connection = "AzureWebJobsStorage")] string messageJson,
+            FunctionContext context)
         {
-            string openAiEndpoint = Environment.GetEnvironmentVariable("GPT4_VISION_ENDPOINT");
-            string openAiDeployment = Environment.GetEnvironmentVariable("GPT4_VISION_DEPLOYMENT_NAME");
-            if (string.IsNullOrEmpty(openAiEndpoint) || string.IsNullOrEmpty(openAiDeployment))
+            var cancellationToken = context.CancellationToken;
+            DocumentIntelligenceQueueMessage diMessage;
+            try
             {
-                _logger.LogError("GPT4_VISION_ENDPOINT or GPT4_VISION_DEPLOYMENT_NAME environment variable is not set.");
+                diMessage = JsonSerializer.Deserialize<DocumentIntelligenceQueueMessage>(messageJson, _camelCaseOptions)
+                    ?? throw new InvalidOperationException("Document Intelligence payload was null");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Invalid Document Intelligence queue message");
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(diMessage.OperationId) || string.IsNullOrWhiteSpace(diMessage.BlobUrl) || diMessage.Workflow is null)
+            {
+                _logger.LogError("Document Intelligence message missing required fields");
+                return;
+            }
+
+            var endpoint = GetRequiredSetting("DOCUMENT_INTELLIGENCE_ENDPOINT");
+            var client = new DocumentAnalysisClient(new Uri(endpoint), new DefaultAzureCredential());
+            var operation = new AnalyzeDocumentOperation(diMessage.OperationId, client);
+            await operation.UpdateStatusAsync(cancellationToken);
+
+            if (!operation.HasCompleted)
+            {
+                _logger.LogInformation("Operation {OperationId} still running - requeue", diMessage.OperationId);
+                var queueName = Environment.GetEnvironmentVariable("OPERATION_QUEUE_NAME") ?? "documentintelligence-events";
+                var queueClient = _queueServiceClient.GetQueueClient(queueName);
+                await queueClient.CreateIfNotExistsAsync(cancellationToken: cancellationToken);
+                await queueClient.SendMessageAsync(
+                    Convert.ToBase64String(Encoding.UTF8.GetBytes(messageJson)),
+                    timeToLive: default,
+                    visibilityTimeout: TimeSpan.FromSeconds(30),
+                    cancellationToken: cancellationToken);
+                return;
+            }
+
+            if (!operation.HasValue)
+            {
+                await FailWorkflowAsync(diMessage.Workflow, "docintelligence", "Operation completed without a result", cancellationToken);
+                return;
+            }
+
+            var result = operation.Value;
+            var blobUri = new Uri(diMessage.BlobUrl);
+            var originalFileName = blobUri.Segments.LastOrDefault()?.Trim('/') ?? "input";
+            var outputTypeFolder = "documentintelligence";
+            var outputFileName = $"{originalFileName}_document_intelligence_output.json";
+            var outputBlobPath = $"{outputTypeFolder}/{outputFileName}";
+
+            var containerClient = _blobServiceClient.GetBlobContainerClient(OutputContainerName);
+            await containerClient.CreateIfNotExistsAsync(cancellationToken: cancellationToken);
+            var blobClient = containerClient.GetBlobClient(outputBlobPath);
+
+            var docJson = JsonSerializer.Serialize(new
+            {
+                reference_id = diMessage.Workflow.ReferenceId,
+                processor = "document intelligence",
+                main_content = result.Content,
+                message = result,
+                original_filename = originalFileName,
+                origin_file = originalFileName,
+                folderName = outputTypeFolder
+            }, new JsonSerializerOptions { WriteIndented = true });
+
+            await UploadJsonAsync(blobClient, docJson, cancellationToken);
+
+            diMessage.Workflow.Metadata["documentintelligence-output"] = outputBlobPath;
+            await AdvanceWorkflowAsync(diMessage.Workflow, cancellationToken);
+        }
+
+        private async Task ExecuteWorkflowStepAsync(
+            string expectedStep,
+            string message,
+            FunctionContext context,
+            Func<WorkflowEnvelope, CancellationToken, Task> handler)
+        {
+            var cancellationToken = context.CancellationToken;
+            WorkflowEnvelope envelope;
+            try
+            {
+                envelope = JsonSerializer.Deserialize<WorkflowEnvelope>(message, _camelCaseOptions)
+                    ?? throw new InvalidOperationException("Workflow envelope payload was null");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to parse workflow envelope for step {Step}", expectedStep);
+                await PublishAlertAsync("unknown", null, $"Invalid workflow envelope for step {expectedStep}", cancellationToken);
                 return;
             }
 
             try
             {
-                AzureOpenAIClient client = new(
-                    new Uri(openAiEndpoint),
-                    new DefaultAzureCredential());
-                ChatClient chatClient = client.GetChatClient(openAiDeployment);
-
-                ChatMessageContentPart imagePart;
-                Stream imageStream;
-                try
-                {
-                    var download = await blobClient.DownloadAsync();
-                    imageStream = new MemoryStream();
-                    await download.Value.Content.CopyToAsync(imageStream);
-                    imageStream.Position = 0;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError($"Failed to download image blob: {ex.Message}");
-                    return;
-                }
-
-                imagePart = ChatMessageContentPart.CreateImagePart(
-                    BinaryData.FromStream(imageStream), "image/jpeg", ChatImageDetailLevel.Low
-                );
-
-                ChatMessage[] messages =
-                [
-                    new SystemChatMessage("You are a helpful assistant that helps describe images."),
-                    new UserChatMessage(imagePart, ChatMessageContentPart.CreateTextPart("describe this image, focus on details which are relevant for insurances and claims"))
-                ];
-
-                ChatCompletionOptions options = new()
-                {
-                    MaxOutputTokenCount = 2048,
-                };
-
-                var response = await chatClient.CompleteChatAsync(messages, options);
-
-                var result = response.Value.Content.Select(t => t.Text).Aggregate((a, b) => a + b);
-
-                // Parse blob path for output (same logic as RunAIVision)
-                var blobUri = new Uri(url);
-                var segments = blobUri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-
-                string outputTypeFolder = "gptvision";
-                string originalFileName = segments.Length > 0 ? segments.Last() : "input";
-                string outputFileName = $"{originalFileName}_gpt4ovision_output.json";
-                string outputBlobPath = $"{outputTypeFolder}/{outputFileName}";
-
-                string outputContainerName = "output";
-                string blob_endpoint = Environment.GetEnvironmentVariable("AzureWebJobsStorage__blobServiceUri");
-                if (string.IsNullOrEmpty(blob_endpoint))
-                {
-                    _logger.LogError("AzureWebJobsStorage__blobServiceUri environment variable is not set.");
-                    return;
-                }
-
-                var blobServiceClient = new BlobServiceClient(new Uri(blob_endpoint), new DefaultAzureCredential());
-                var containerClient = blobServiceClient.GetBlobContainerClient(outputContainerName);
-                await containerClient.CreateIfNotExistsAsync();
-                var outputBlobClient = containerClient.GetBlobClient(outputBlobPath);
-
-                var outputJson = System.Text.Json.JsonSerializer.Serialize(new {
-                    processor = "gpt4o vision",
-                    main_content = result,
-                    message = result,
-                    original_filename = originalFileName,
-                    origin_file = originalFileName,
-                    folderName = outputTypeFolder
-                }, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
-
-                using var ms = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(outputJson));
-                var uploadOptions = new Azure.Storage.Blobs.Models.BlobUploadOptions
-                {
-                    HttpHeaders = new Azure.Storage.Blobs.Models.BlobHttpHeaders { ContentType = "application/json" }
-                };
-                await outputBlobClient.UploadAsync(ms, uploadOptions);
-
-                _logger.LogInformation($"Stored GPT-4o Vision result in output container at path: {outputBlobPath}");
+                await handler(envelope, cancellationToken);
             }
             catch (Exception ex)
             {
-                _logger.LogError($"Error in RunGPTVision: {ex.Message}");
+                await FailWorkflowAsync(envelope, expectedStep, ex.Message, cancellationToken);
+                throw;
             }
         }
 
-        private async Task CheckAndTranslateIfNecessary(string url, BlobClient blobClient)
+        private async Task RunDocumentIntelligenceStepAsync(WorkflowEnvelope envelope, CancellationToken cancellationToken)
         {
-            // Download the .txt file content
+            var endpoint = GetRequiredSetting("DOCUMENT_INTELLIGENCE_ENDPOINT");
+            var client = new DocumentAnalysisClient(new Uri(endpoint), new DefaultAzureCredential());
+            var modelId = ResolveDocumentIntelligenceModel(envelope.Metadata);
+            var blobUri = BuildBlobUri(envelope.BlobPath);
+
+            // Use stream instead of URI to avoid managed identity propagation issues or SAS requirements
+            var blobClient = GetBlobClientForPath(envelope.BlobPath);
+            using var stream = await blobClient.OpenReadAsync(cancellationToken: cancellationToken);
+
+            var operation = await client.AnalyzeDocumentAsync(WaitUntil.Started, modelId, stream, cancellationToken: cancellationToken);
+            var queueName = Environment.GetEnvironmentVariable("OPERATION_QUEUE_NAME") ?? "documentintelligence-events";
+            var queueClient = _queueServiceClient.GetQueueClient(queueName);
+            await queueClient.CreateIfNotExistsAsync(cancellationToken: cancellationToken);
+
+            var message = new DocumentIntelligenceQueueMessage
+            {
+                OperationId = operation.Id,
+                BlobUrl = blobUri.ToString(),
+                Workflow = envelope
+            };
+
+            var payload = JsonSerializer.Serialize(message, _camelCaseOptions);
+            await queueClient.SendMessageAsync(Convert.ToBase64String(Encoding.UTF8.GetBytes(payload)), cancellationToken: cancellationToken);
+            _logger.LogInformation("Document Intelligence started for {ReferenceId} ({OperationId})", envelope.ReferenceId, operation.Id);
+        }
+
+        private async Task RunTranslationStepAsync(WorkflowEnvelope envelope, CancellationToken cancellationToken)
+        {
+            var blobClient = GetBlobClientForPath(envelope.BlobPath);
             string textContent;
             try
             {
-                var download = await blobClient.DownloadAsync();
-                using (var reader = new StreamReader(download.Value.Content))
-                {
-                    textContent = await reader.ReadToEndAsync();
-                }
+                var download = await blobClient.DownloadAsync(cancellationToken: cancellationToken);
+                using var reader = new StreamReader(download.Value.Content);
+                textContent = await reader.ReadToEndAsync();
             }
             catch (Exception ex)
             {
-                _logger.LogError($"Failed to download blob content: {ex.Message}");
-                return;
+                throw new InvalidOperationException($"Failed to read blob content: {ex.Message}");
             }
-
-            // Preprocess: split by \n and remove the first element
 
             var lines = textContent.Split('\n');
             if (lines.Length > 1)
@@ -227,359 +370,539 @@ namespace InboundProcess
                 textContent = string.Join("\n", lines.Skip(1));
             }
 
-            // Detect language using Azure.AI.TextAnalytics
-            string language = "en";
+            var languageEndpoint = GetRequiredSetting("AI_LANGUAGE_ENDPOINT");
+            var textAnalyticsClient = new TextAnalyticsClient(new Uri(languageEndpoint), new DefaultAzureCredential());
+            string language;
             try
             {
-                var endpoint = Environment.GetEnvironmentVariable("AI_LANGUAGE_ENDPOINT");
-                if (string.IsNullOrEmpty(endpoint))
-                {
-                    _logger.LogError("AI_LANGUAGE_ENDPOINT environment variable is not set.");
-                    return;
-                }
-                var credential = new DefaultAzureCredential();
-                var textAnalyticsClient = new Azure.AI.TextAnalytics.TextAnalyticsClient(new Uri(endpoint), credential);
-                var response = await textAnalyticsClient.DetectLanguageAsync(textContent);
+                var response = await textAnalyticsClient.DetectLanguageAsync(textContent, cancellationToken: cancellationToken);
                 language = response.Value.Iso6391Name;
-                _logger.LogInformation($"Detected language: {language} for text: {textContent}");
             }
             catch (Exception ex)
             {
-                _logger.LogError($"Failed to detect language: {ex.Message}");
-                return;
+                throw new InvalidOperationException($"Failed to detect language: {ex.Message}");
             }
 
             string translatedText = textContent;
             bool wasTranslated = false;
-            if (language != "en")
+            if (!string.Equals(language, "en", StringComparison.OrdinalIgnoreCase))
             {
+                var translationEndpoint = GetRequiredSetting("AI_TRANSLATOR_ENDPOINT");
+                var translationClient = new TextTranslationClient(new DefaultAzureCredential(), new Uri(translationEndpoint));
                 try
                 {
-                    var translationEndpoint = Environment.GetEnvironmentVariable("AI_TRANSLATOR_ENDPOINT");
-                    if (string.IsNullOrEmpty(translationEndpoint))
-                    {
-                        _logger.LogError("AI_TRANSLATOR_ENDPOINT environment variable is not set.");
-                        return;
-                    }
-                    var translationClient = new Azure.AI.Translation.Text.TextTranslationClient(new DefaultAzureCredential(), new Uri(translationEndpoint));
                     var translateResult = await translationClient.TranslateAsync(
                         targetLanguage: "en",
                         sourceLanguage: language,
-                        content: new[] { textContent }
-                    );
+                        content: new[] { textContent },
+                        cancellationToken: cancellationToken);
                     translatedText = string.Join("\n", translateResult.Value[0].Translations.Select(t => t.Text));
                     wasTranslated = true;
-                    _logger.LogInformation($"Translated text from {language} to en.");
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError($"Failed to translate text: {ex.Message}");
-                    return;
+                    throw new InvalidOperationException($"Failed to translate text: {ex.Message}");
                 }
             }
 
+            var originalFileName = Path.GetFileName(envelope.BlobPath);
+            var outputTypeFolder = wasTranslated ? "translation" : "textpassthrough";
+            var outputFileName = $"{originalFileName}_translated.json";
+            var outputBlobPath = $"{outputTypeFolder}/{outputFileName}";
+
+            var containerClient = _blobServiceClient.GetBlobContainerClient(OutputContainerName);
+            await containerClient.CreateIfNotExistsAsync(cancellationToken: cancellationToken);
+            var outputBlobClient = containerClient.GetBlobClient(outputBlobPath);
+
+            var outputJson = JsonSerializer.Serialize(new
+            {
+                reference_id = envelope.ReferenceId,
+                processor = wasTranslated ? "translation" : "text passthrough",
+                main_content = translatedText,
+                message = translatedText,
+                original_filename = originalFileName,
+                origin_file = originalFileName,
+                folderName = outputTypeFolder
+            }, new JsonSerializerOptions { WriteIndented = true });
+
+            await UploadJsonAsync(outputBlobClient, outputJson, cancellationToken);
+
+            envelope.Metadata[$"{outputTypeFolder}-output"] = outputBlobPath;
+            await AdvanceWorkflowAsync(envelope, cancellationToken);
+        }
+
+        private async Task RunPiiStepAsync(WorkflowEnvelope envelope, CancellationToken cancellationToken)
+        {
+            if (!envelope.Metadata.TryGetValue("documentintelligence-output", out var docIntPath) || string.IsNullOrWhiteSpace(docIntPath))
+            {
+                throw new InvalidOperationException("Document Intelligence output path not found in workflow metadata");
+            }
+
+            var containerClient = _blobServiceClient.GetBlobContainerClient(OutputContainerName);
+            var sourceBlob = containerClient.GetBlobClient(docIntPath);
+            string blobContent;
             try
             {
-                var blobUri = new Uri(url);
-                var segments = blobUri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-                // segments[0] = container, segments[1..n-1] = folders, segments[^1] = filename
-                string originalFileName = segments.Length > 0 ? segments[^1] : "input";
-
-                string outputTypeFolder = wasTranslated ? "translation" : "textpassthrough";
-                string outputFileName = $"{originalFileName}_translated.json";
-                string outputBlobPath = $"{outputTypeFolder}/{outputFileName}";
-
-                string outputContainerName = "output";
-                string blob_endpoint = Environment.GetEnvironmentVariable("AzureWebJobsStorage__blobServiceUri");
-                if (string.IsNullOrEmpty(blob_endpoint))
-                {
-                    _logger.LogError("AzureWebJobsStorage__blobServiceUri environment variable is not set.");
-                    return;
-                }
-
-                var blobServiceClient = new BlobServiceClient(new Uri(blob_endpoint), new DefaultAzureCredential());
-                var containerClient = blobServiceClient.GetBlobContainerClient(outputContainerName);
-                await containerClient.CreateIfNotExistsAsync();
-                var outputBlobClient = containerClient.GetBlobClient(outputBlobPath);
-
-
-                var outputJson = System.Text.Json.JsonSerializer.Serialize(new {
-                    processor = wasTranslated ? "translation" : "text passthrough",
-                    main_content = translatedText,
-                    message = translatedText,
-                    original_filename = originalFileName,
-                    origin_file = originalFileName,
-                    folderName = outputTypeFolder
-                }, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
-
-
-                using var ms = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(outputJson));
-                var uploadOptions = new Azure.Storage.Blobs.Models.BlobUploadOptions
-                {
-                    HttpHeaders = new Azure.Storage.Blobs.Models.BlobHttpHeaders { ContentType = "application/json" }
-                };
-                await outputBlobClient.UploadAsync(ms, uploadOptions);
-
-                _logger.LogInformation($"Stored translated text in output container at path: {outputBlobPath}");
+                var download = await sourceBlob.DownloadContentAsync(cancellationToken);
+                blobContent = download.Value.Content.ToString();
             }
             catch (Exception ex)
             {
-                _logger.LogError($"Failed to store translated text: {ex.Message}");
+                throw new InvalidOperationException($"Failed to read Document Intelligence output '{docIntPath}': {ex.Message}");
             }
+
+            string contentToAnalyze;
+            try
+            {
+                using var doc = JsonDocument.Parse(blobContent);
+                if (!doc.RootElement.TryGetProperty("Content", out var contentProp))
+                {
+                    throw new InvalidOperationException("Document Intelligence output missing 'Content' property");
+                }
+
+                contentToAnalyze = contentProp.GetString() ?? string.Empty;
+            }
+            catch (Exception ex) when (ex is JsonException or InvalidOperationException)
+            {
+                throw new InvalidOperationException($"Invalid Document Intelligence output JSON: {ex.Message}");
+            }
+
+            if (string.IsNullOrWhiteSpace(contentToAnalyze))
+            {
+                throw new InvalidOperationException("No content found to analyze for PII");
+            }
+
+            const int maxChunkSize = 5120;
+            var chunks = new List<string>();
+            for (var index = 0; index < contentToAnalyze.Length; index += maxChunkSize)
+            {
+                chunks.Add(contentToAnalyze.Substring(index, Math.Min(maxChunkSize, contentToAnalyze.Length - index)));
+            }
+
+            var piiEndpoint = GetRequiredSetting("PII_DETECTION_ENDPOINT");
+            var client = new TextAnalyticsClient(new Uri(piiEndpoint), new DefaultAzureCredential());
+            var allResults = new List<object>();
+
+            for (var chunkIndex = 0; chunkIndex < chunks.Count; chunkIndex++)
+            {
+                try
+                {
+                    var response = await client.RecognizePiiEntitiesAsync(chunks[chunkIndex], language: "en", cancellationToken: cancellationToken);
+                    var entities = response.Value;
+                    allResults.Add(new
+                    {
+                        chunk = chunkIndex,
+                        entities,
+                        redactedText = entities.RedactedText
+                    });
+                }
+                catch (Exception ex)
+                {
+                    throw new InvalidOperationException($"Error calling PII detection service for chunk {chunkIndex + 1}: {ex.Message}");
+                }
+            }
+
+            var originalFileName = Path.GetFileName(docIntPath);
+            var outputTypeFolder = "pii_detection";
+            var outputFileName = $"{originalFileName}_pii_detection_result.json";
+            var outputPath = $"{outputTypeFolder}/{outputFileName}";
+            var resultBlobClient = containerClient.GetBlobClient(outputPath);
+
+            var outputJson = JsonSerializer.Serialize(new
+            {
+                reference_id = envelope.ReferenceId,
+                processor = "pii detection",
+                main_content = "PII detection completed",
+                message = allResults,
+                original_filename = originalFileName,
+                origin_file = originalFileName,
+                folderName = outputTypeFolder
+            }, new JsonSerializerOptions { WriteIndented = true });
+
+            await UploadJsonAsync(resultBlobClient, outputJson, cancellationToken);
+
+            envelope.Metadata["pii-output"] = outputPath;
+            await AdvanceWorkflowAsync(envelope, cancellationToken);
         }
 
-        private async Task RunAIVision(string url, BlobClient blobClient)
+        private async Task RunAIVisionStepAsync(WorkflowEnvelope envelope, CancellationToken cancellationToken)
         {
-            string aiVisionEndpoint = Environment.GetEnvironmentVariable("AI_VISION_ENDPOINT");
-            if (string.IsNullOrEmpty(aiVisionEndpoint))
+            var endpoint = GetRequiredSetting("AI_VISION_ENDPOINT");
+            var client = new ImageAnalysisClient(new Uri(endpoint), new DefaultAzureCredential());
+            var blobClient = GetBlobClientForPath(envelope.BlobPath);
+
+            Stream imageStream;
+            try
             {
-                _logger.LogError("AI_VISION_ENDPOINT environment variable is not set.");
+                var download = await blobClient.DownloadAsync(cancellationToken: cancellationToken);
+                imageStream = new MemoryStream();
+                await download.Value.Content.CopyToAsync(imageStream, cancellationToken);
+                imageStream.Position = 0;
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException($"Failed to download blob content: {ex.Message}");
+            }
+
+            var options = new ImageAnalysisOptions { GenderNeutralCaption = true };
+            var result = await client.AnalyzeAsync(
+                BinaryData.FromStream(imageStream),
+                VisualFeatures.Read | VisualFeatures.Objects | VisualFeatures.Tags,
+                options,
+                cancellationToken);
+
+            var outputTypeFolder = "aivision";
+            var outputFileName = $"{Path.GetFileName(envelope.BlobPath)}_aivision_output.json";
+            var outputBlobPath = $"{outputTypeFolder}/{outputFileName}";
+            var containerClient = _blobServiceClient.GetBlobContainerClient(OutputContainerName);
+            await containerClient.CreateIfNotExistsAsync(cancellationToken: cancellationToken);
+            var outputBlobClient = containerClient.GetBlobClient(outputBlobPath);
+
+            var resultJson = JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
+            var visionOutputJson = JsonSerializer.Serialize(new
+            {
+                reference_id = envelope.ReferenceId,
+                processor = "aivision",
+                main_content = string.Join(",", result.Value.Tags.Values.Select(t => $"{t.Name}:{t.Confidence}")),
+                message = JsonDocument.Parse(resultJson).RootElement,
+                original_filename = Path.GetFileName(envelope.BlobPath),
+                origin_file = Path.GetFileName(envelope.BlobPath),
+                folderName = outputTypeFolder
+            }, new JsonSerializerOptions { WriteIndented = true });
+
+            await UploadJsonAsync(outputBlobClient, visionOutputJson, cancellationToken);
+
+            envelope.Metadata["aivision-output"] = outputBlobPath;
+            await AdvanceWorkflowAsync(envelope, cancellationToken);
+        }
+
+        private async Task RunGptVisionStepAsync(WorkflowEnvelope envelope, CancellationToken cancellationToken)
+        {
+            var openAiEndpoint = GetRequiredSetting("GPT4_VISION_ENDPOINT");
+            var openAiDeployment = GetRequiredSetting("GPT4_VISION_DEPLOYMENT_NAME");
+            var blobClient = GetBlobClientForPath(envelope.BlobPath);
+
+            Stream imageStream;
+            try
+            {
+                var download = await blobClient.DownloadAsync(cancellationToken: cancellationToken);
+                imageStream = new MemoryStream();
+                await download.Value.Content.CopyToAsync(imageStream, cancellationToken);
+                imageStream.Position = 0;
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException($"Failed to download blob content: {ex.Message}");
+            }
+
+            var client = new AzureOpenAIClient(new Uri(openAiEndpoint), new DefaultAzureCredential());
+            var chatClient = client.GetChatClient(openAiDeployment);
+
+            var imagePart = ChatMessageContentPart.CreateImagePart(BinaryData.FromStream(imageStream), "image/jpeg", ChatImageDetailLevel.Low);
+            ChatMessage[] messages =
+            [
+                new SystemChatMessage("You are a helpful assistant that helps describe images."),
+                new UserChatMessage(imagePart, ChatMessageContentPart.CreateTextPart("describe this image, focus on details which are relevant for insurances and claims"))
+            ];
+
+            var response = await chatClient.CompleteChatAsync(messages, new ChatCompletionOptions { MaxOutputTokenCount = 2048 }, cancellationToken);
+            var result = response.Value.Content.Select(t => t.Text).Aggregate((a, b) => a + b);
+
+            var outputTypeFolder = "gptvision";
+            var originalFileName = Path.GetFileName(envelope.BlobPath);
+            var outputFileName = $"{originalFileName}_gpt4ovision_output.json";
+            var outputBlobPath = $"{outputTypeFolder}/{outputFileName}";
+
+            var containerClient = _blobServiceClient.GetBlobContainerClient(OutputContainerName);
+            await containerClient.CreateIfNotExistsAsync(cancellationToken: cancellationToken);
+            var outputBlobClient = containerClient.GetBlobClient(outputBlobPath);
+
+            var outputJson = JsonSerializer.Serialize(new
+            {
+                reference_id = envelope.ReferenceId,
+                processor = "gpt4o vision",
+                main_content = result,
+                message = result,
+                original_filename = originalFileName,
+                origin_file = originalFileName,
+                folderName = outputTypeFolder
+            }, new JsonSerializerOptions { WriteIndented = true });
+
+            await UploadJsonAsync(outputBlobClient, outputJson, cancellationToken);
+
+            envelope.Metadata["gptvision-output"] = outputBlobPath;
+            await AdvanceWorkflowAsync(envelope, cancellationToken);
+        }
+
+        private async Task EnqueueWorkflowAsync(WorkflowEnvelope envelope, CancellationToken cancellationToken)
+        {
+            if (envelope is null)
+            {
+                throw new ArgumentNullException(nameof(envelope));
+            }
+
+            if (!_workflowQueues.TryGetValue(envelope.CurrentStep, out var queueName) || string.IsNullOrWhiteSpace(queueName))
+            {
+                var reason = $"No queue configured for workflow step '{envelope.CurrentStep}'";
+                _logger.LogError(reason);
+                await PublishAlertAsync(envelope.BlobPath, envelope.ReferenceId, reason, cancellationToken);
+                return;
+            }
+
+            var queueClient = _queueServiceClient.GetQueueClient(queueName);
+            await queueClient.CreateIfNotExistsAsync(cancellationToken: cancellationToken);
+            var payload = JsonSerializer.Serialize(envelope, _camelCaseOptions);
+            await queueClient.SendMessageAsync(Convert.ToBase64String(Encoding.UTF8.GetBytes(payload)), cancellationToken: cancellationToken);
+            _logger.LogInformation(
+                "Enqueued step {Step} for reference {ReferenceId} ({Remaining} remaining)",
+                envelope.CurrentStep,
+                envelope.ReferenceId,
+                envelope.RemainingSteps.Count);
+        }
+
+        private async Task AdvanceWorkflowAsync(WorkflowEnvelope envelope, CancellationToken cancellationToken)
+        {
+            if (envelope.RemainingSteps is null || envelope.RemainingSteps.Count == 0)
+            {
+                _logger.LogInformation("Workflow complete for reference {ReferenceId}", envelope.ReferenceId);
+                return;
+            }
+
+            envelope.CurrentStep = envelope.RemainingSteps[0];
+            envelope.RemainingSteps.RemoveAt(0);
+            await EnqueueWorkflowAsync(envelope, cancellationToken);
+        }
+
+        private async Task FailWorkflowAsync(WorkflowEnvelope envelope, string step, string error, CancellationToken cancellationToken)
+        {
+            if (envelope is null)
+            {
+                await PublishAlertAsync("unknown", null, $"Step {step} failed: {error}", cancellationToken);
+                return;
+            }
+
+            envelope.Failure = new WorkflowFailure
+            {
+                Step = step,
+                Error = error,
+                Timestamp = DateTimeOffset.UtcNow
+            };
+
+            await PublishAlertAsync(envelope.BlobPath, envelope.ReferenceId, $"Step {step} failed: {error}", cancellationToken);
+        }
+
+        private async Task PublishAlertAsync(string blobPath, string referenceId, string reason, CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrWhiteSpace(_alertQueueName))
+            {
+                _logger.LogWarning("Alert queue name empty; cannot publish alert for {BlobPath}", blobPath);
                 return;
             }
 
             try
             {
-                var credential = new DefaultAzureCredential();
-                var client = new ImageAnalysisClient(new Uri(aiVisionEndpoint), credential);
-
-                // Download the image as bytes from blob storage
-                Stream imageStream;
-                try
+                var queueClient = _queueServiceClient.GetQueueClient(_alertQueueName);
+                await queueClient.CreateIfNotExistsAsync(cancellationToken: cancellationToken);
+                var alert = new WorkflowAlertMessage
                 {
-                    var download = await blobClient.DownloadAsync();
-                    imageStream = new MemoryStream();
-                    await download.Value.Content.CopyToAsync(imageStream);
-                    imageStream.Position = 0;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError($"Failed to download image blob: {ex.Message}");
-                    return;
-                }
-
-                var options = new ImageAnalysisOptions { GenderNeutralCaption = true };
-                var result = await client.AnalyzeAsync(
-                    BinaryData.FromStream(imageStream),
-                    /*VisualFeatures.DenseCaptions |*/ VisualFeatures.Read | VisualFeatures.Objects | VisualFeatures.Tags,
-                    options);
-
-                var resultJson = System.Text.Json.JsonSerializer.Serialize(result, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
-
-                // Parse blob path for output
-                var blobUri = new Uri(url);
-                var segments = blobUri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-                // segments[0] = container, segments[1..n-1] = folders, segments[^1] = filename
-
-                string outputTypeFolder = "aivision";
-                string outputFileName = $"{segments.Last()}_aivision_output.json";
-                string outputBlobPath = $"{outputTypeFolder}/{outputFileName}";
-
-                string outputContainerName = "output";
-                string blob_endpoint = Environment.GetEnvironmentVariable("AzureWebJobsStorage__blobServiceUri");
-                if (string.IsNullOrEmpty(blob_endpoint))
-                {
-                    _logger.LogError("AzureWebJobsStorage__blobServiceUri environment variable is not set.");
-                    return;
-                }
-
-                var blobServiceClient = new BlobServiceClient(new Uri(blob_endpoint), new DefaultAzureCredential());
-                var containerClient = blobServiceClient.GetBlobContainerClient(outputContainerName);
-                await containerClient.CreateIfNotExistsAsync();
-                var outputBlobClient = containerClient.GetBlobClient(outputBlobPath);
-
-                var visionOutputJson = System.Text.Json.JsonSerializer.Serialize(new {
-                    processor = "aivision",
-                    main_content = string.Join(",", result.Value.Tags.Values.Select(t => $"{t.Name}:{t.Confidence}")),
-                    message = System.Text.Json.JsonDocument.Parse(resultJson).RootElement,
-                    original_filename = segments.Last(),
-                    origin_file = segments.Last(),
-                    folderName = outputTypeFolder
-                }, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
-
-                using var ms = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(visionOutputJson));
-                var uploadOptions = new Azure.Storage.Blobs.Models.BlobUploadOptions
-                {
-                    HttpHeaders = new Azure.Storage.Blobs.Models.BlobHttpHeaders { ContentType = "application/json" }
+                    ReferenceId = referenceId ?? "unknown",
+                    BlobPath = blobPath,
+                    FailedStep = "orchestrator",
+                    Error = reason,
+                    Timestamp = DateTimeOffset.UtcNow
                 };
-                await outputBlobClient.UploadAsync(ms, uploadOptions);
-
-                _logger.LogInformation($"Stored AI Vision result in output container at path: {outputBlobPath}");
+                var payload = JsonSerializer.Serialize(alert, _camelCaseOptions);
+                await queueClient.SendMessageAsync(Convert.ToBase64String(Encoding.UTF8.GetBytes(payload)), cancellationToken: cancellationToken);
+                _logger.LogInformation("Alert queued for {BlobPath}: {Reason}", blobPath, reason);
             }
             catch (Exception ex)
             {
-                _logger.LogError($"Error in RunAIVision: {ex.Message}");
+                _logger.LogError(ex, "Failed to publish workflow alert for {BlobPath}", blobPath);
             }
         }
 
-        private async Task RunDocumentIntelligence(string url, BlobClient blobClient)
+        private async Task<Dictionary<string, string>> ReadBlobMetadataAsync(BlobClient blobClient, CancellationToken cancellationToken)
         {
-            string modelId = "prebuilt-document";
-            try
+            var metadata = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var properties = await blobClient.GetPropertiesAsync(cancellationToken: cancellationToken);
+            foreach (var pair in properties.Value.Metadata)
             {
-                var tags = await blobClient.GetTagsAsync();
-                if (tags.Value.Tags.TryGetValue("document-model", out var tagModel) && !string.IsNullOrWhiteSpace(tagModel))
+                if (!string.IsNullOrWhiteSpace(pair.Key))
                 {
-                    modelId = tagModel;
-                    _logger.LogInformation($"Using model from blob index tag: {modelId}");
-                }
-                else
-                {
-                    _logger.LogInformation("No 'document-model' blob index tag found, using default 'prebuilt-document'.");
+                    metadata[pair.Key] = pair.Value;
                 }
             }
-            catch (Exception ex)
-            {
-                _logger.LogWarning($"Could not read blob index tags, using default model. Error: {ex.Message}");
-            }
 
-            var client = new DocumentAnalysisClient(new Uri(Environment.GetEnvironmentVariable("DOCUMENT_INTELLIGENCE_ENDPOINT")), new DefaultAzureCredential());
             try
             {
-                var operation = await client.AnalyzeDocumentFromUriAsync(Azure.WaitUntil.Started, modelId, new Uri(url));
-                string operationId = operation.Id;
-                _logger.LogInformation($"Document Intelligence operation started. OperationId: {operationId}");
-
-                // Enqueue operationId and blob url to Azure Storage queue for later processing
-                string queueUri = Environment.GetEnvironmentVariable("AzureWebJobsStorage__queueServiceUri");
-                string queueName = Environment.GetEnvironmentVariable("OPERATION_QUEUE_NAME") ?? "documentintelligence-events";
-                var queueClient = new QueueClient(new Uri($"{queueUri}{queueName}"), new DefaultAzureCredential());
-                await queueClient.CreateIfNotExistsAsync();
-
-                var message = new { operationId, blobUrl = url };
-                string base64Message = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(message)));
-                await queueClient.SendMessageAsync(base64Message, visibilityTimeout: TimeSpan.FromSeconds(10));
-                _logger.LogInformation($"Enqueued operationId and blob url to queue: {operationId} {queueName}");
+                var tags = await blobClient.GetTagsAsync(cancellationToken: cancellationToken);
+                foreach (var tag in tags.Value.Tags)
+                {
+                    metadata[tag.Key] = tag.Value;
+                }
             }
-            catch (Exception ex)
+            catch (RequestFailedException ex) when (ex.Status == 404 || ex.Status == 409)
             {
-                _logger.LogError($"Error starting Document Intelligence operation or enqueuing: {ex.Message}");
+                _logger.LogDebug(ex, "Blob tags unavailable for {Blob}", blobClient.Name);
             }
+
+            return metadata;
         }
 
-        [Function("ProcessDocumentIntelligenceResult")]
-        public async Task ProcessDocumentIntelligenceResult(
-            [QueueTrigger("documentintelligence-events")] string messageJson,
-            FunctionContext context)
+        private static string ResolveReferenceId(IDictionary<string, string> metadata)
         {
-            _logger.LogInformation($"message: {messageJson}");
-            try
+            if (metadata is null)
             {
-                var message = JsonSerializer.Deserialize<OperationQueueMessage>(messageJson);
-                if (message == null || string.IsNullOrEmpty(message.operationId) || string.IsNullOrEmpty(message.blobUrl))
-                {
-                    _logger.LogError("Invalid queue message format.");
-                    return;
-                }
-
-                string endpoint = Environment.GetEnvironmentVariable("DOCUMENT_INTELLIGENCE_ENDPOINT");
-                var client = new DocumentAnalysisClient(new Uri(endpoint), new DefaultAzureCredential());
-
-                // Poll the operation status using AnalyzeDocumentOperation
-                var operation = new AnalyzeDocumentOperation(message.operationId, client);
-                await operation.UpdateStatusAsync();
-
-                if (!operation.HasCompleted)
-                {
-                    _logger.LogInformation($"Operation {message.operationId} not ready, re-queueing with 30s delay.");
-                    // Re-queue with 30s delay
-                    string queueUri = Environment.GetEnvironmentVariable("AzureWebJobsStorage__queueServiceUri");
-                    string queueName = Environment.GetEnvironmentVariable("OPERATION_QUEUE_NAME") ?? "documentintelligence-events";
-                    QueueClient queueClient = new QueueClient(new Uri($"{queueUri}{queueName}"), new DefaultAzureCredential());
-                    await queueClient.CreateIfNotExistsAsync();
-                    await queueClient.SendMessageAsync(Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(messageJson)), null, TimeSpan.FromSeconds(30));
-                    return;
-                }
-
-                if (operation.HasValue)
-                {
-                    var result = operation.Value;
-                    _logger.LogInformation($"Document Intelligence operation {message.operationId} completed. Result: {result.ModelId}");
-
-                    // Store result as JSON in output container, in a folder named after the analyzed file
-                    try
-                    {
-                        // Parse the blob name from the URL
-
-                        var blobUri = new Uri(message.blobUrl);
-                        string[] segments = blobUri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-                        // segments[0] = container, segments[1..n-1] = folders, segments[^1] = filename
-
-                        string originalFileName = segments.Length > 0 ? segments[^1] : "input";
-
-                        string outputTypeFolder = "documentintelligence";
-                        string outputFileName = $"{originalFileName}_document_intelligence_output.json";
-                        string outputBlobPath = $"{outputTypeFolder}/{outputFileName}";
-
-                        // Get output container connection string and name
-                        string outputContainerName = "output";
-                        string blob_endpoint = Environment.GetEnvironmentVariable("AzureWebJobsStorage__blobServiceUri");
-                        if (string.IsNullOrEmpty(blob_endpoint))
-                        {
-                            _logger.LogError("AzureWebJobsStorage environment variable is not set.");
-                            return;
-                        }
-
-                        // Create blob client and upload JSON
-                        var blobServiceClient = new BlobServiceClient(new Uri(blob_endpoint), new DefaultAzureCredential());
-                        var containerClient = blobServiceClient.GetBlobContainerClient(outputContainerName);
-                        await containerClient.CreateIfNotExistsAsync();
-                        var blobClient = containerClient.GetBlobClient(outputBlobPath);
-
-                        // Serialize result to JSON
-
-                        // Add origin_file and folderName to the output JSON
-                        var docIntelligenceJson = JsonSerializer.Serialize(new {
-                            processor = "document intelligence",
-                            main_content = result.Content,
-                            message = result,
-                            original_filename = originalFileName,
-                            origin_file = originalFileName,
-                            folderName = outputTypeFolder
-                        }, new JsonSerializerOptions { WriteIndented = true });
-
-                        using (var ms = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(docIntelligenceJson)))
-                        {
-                            var uploadOptions = new Azure.Storage.Blobs.Models.BlobUploadOptions
-                            {
-                                HttpHeaders = new Azure.Storage.Blobs.Models.BlobHttpHeaders { ContentType = "application/json" }
-                            };
-                            await blobClient.UploadAsync(ms, uploadOptions);
-                        }
-                        _logger.LogInformation($"Stored result in output container at path: {outputBlobPath}");
-
-                        // Send event to 'pii-in' storage queue for further PII processing
-                        string piiQueueName = "pii-in";
-                        var piiQueueUri = Environment.GetEnvironmentVariable("AzureWebJobsStorage__queueServiceUri");
-                        if (string.IsNullOrEmpty(piiQueueUri))
-                        {
-                            _logger.LogError("AzureWebJobsStorage__queueServiceUri environment variable is not set.");
-                        }
-                        else
-                        {
-                            var piiQueueClient = new QueueClient(new Uri($"{piiQueueUri}{piiQueueName}"), new DefaultAzureCredential());
-                            await piiQueueClient.CreateIfNotExistsAsync();
-                            var piiEvent = new { outputPath = outputBlobPath };
-                            string piiMessage = JsonSerializer.Serialize(piiEvent);
-                            string piiBase64Message = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(piiMessage));
-                            await piiQueueClient.SendMessageAsync(piiBase64Message);
-                            _logger.LogInformation($"Sent event to 'pii-in' queue with outputPath: {outputBlobPath}");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError($"Failed to store result in output container: {ex.Message}");
-                    }
-                }
-                else
-                {
-                    _logger.LogError($"Operation {message.operationId} completed but no result found.");
-                }
+                return null;
             }
-            catch (Exception ex)
-            {
-                _logger.LogError($"Error processing Document Intelligence result: {ex.Message}");
-                throw;
-            }
+
+            return metadata.TryGetValue(ReferenceIdMetadataKey, out var value) && !string.IsNullOrWhiteSpace(value)
+                ? value.Trim()
+                : null;
         }
+
+        private List<string> ResolveWorkflowSteps(IDictionary<string, string> metadata)
+        {
+            if (metadata != null && metadata.TryGetValue(WorkflowStepsMetadataKey, out var rawSteps))
+            {
+                var parsed = ParseWorkflowSteps(rawSteps);
+                if (parsed.Count > 0)
+                {
+                    return parsed;
+                }
+            }
+
+            var defaultWorkflow = Environment.GetEnvironmentVariable("DEFAULT_WORKFLOW");
+            return ParseWorkflowSteps(defaultWorkflow);
+        }
+
+        private static List<string> ParseWorkflowSteps(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                return new List<string>();
+            }
+
+            return raw.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                .Select(step => step.Trim().ToLowerInvariant())
+                .Where(step => !string.IsNullOrWhiteSpace(step))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private BlobClient GetBlobClientForPath(string blobPath)
+        {
+            if (string.IsNullOrWhiteSpace(blobPath))
+            {
+                throw new ArgumentException("Blob path is required", nameof(blobPath));
+            }
+
+            var segments = blobPath.Split('/', 2, StringSplitOptions.RemoveEmptyEntries);
+            if (segments.Length != 2)
+            {
+                throw new InvalidOperationException($"Blob path '{blobPath}' is invalid");
+            }
+
+            return _blobServiceClient.GetBlobContainerClient(segments[0]).GetBlobClient(segments[1]);
+        }
+
+        private Uri BuildBlobUri(string blobPath) => new(_blobServiceClient.Uri, blobPath);
+
+        private static string GetRequiredSetting(string key)
+        {
+            var value = Environment.GetEnvironmentVariable(key);
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                throw new InvalidOperationException($"Configuration value '{key}' is required");
+            }
+
+            return value.Trim();
+        }
+
+        private static string ResolveDocumentIntelligenceModel(IDictionary<string, string> metadata)
+        {
+            if (metadata != null && metadata.TryGetValue("document-model", out var model) && !string.IsNullOrWhiteSpace(model))
+            {
+                return model.Trim();
+            }
+
+            return "prebuilt-document";
+        }
+
+        private static BlobServiceClient CreateBlobServiceClient()
+        {
+            var blobServiceUri = Environment.GetEnvironmentVariable("AzureWebJobsStorage__blobServiceUri");
+            if (!string.IsNullOrWhiteSpace(blobServiceUri))
+            {
+                return new BlobServiceClient(new Uri(blobServiceUri), new DefaultAzureCredential());
+            }
+
+            var connectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage");
+            if (!string.IsNullOrWhiteSpace(connectionString))
+            {
+                return new BlobServiceClient(connectionString);
+            }
+
+            throw new InvalidOperationException("Unable to create BlobServiceClient. Configure AzureWebJobsStorage or AzureWebJobsStorage__blobServiceUri");
+        }
+
+        private static QueueServiceClient CreateQueueServiceClient()
+        {
+            var queueServiceUri = Environment.GetEnvironmentVariable("AzureWebJobsStorage__queueServiceUri");
+            if (!string.IsNullOrWhiteSpace(queueServiceUri))
+            {
+                return new QueueServiceClient(new Uri(queueServiceUri), new DefaultAzureCredential());
+            }
+
+            var connectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage");
+            if (!string.IsNullOrWhiteSpace(connectionString))
+            {
+                return new QueueServiceClient(connectionString);
+            }
+
+            var blobServiceUri = Environment.GetEnvironmentVariable("AzureWebJobsStorage__blobServiceUri");
+            if (!string.IsNullOrWhiteSpace(blobServiceUri))
+            {
+                var derived = blobServiceUri.Replace(".blob.", ".queue.", StringComparison.OrdinalIgnoreCase);
+                return new QueueServiceClient(new Uri(derived), new DefaultAzureCredential());
+            }
+
+            throw new InvalidOperationException("Unable to create QueueServiceClient. Configure AzureWebJobsStorage or AzureWebJobsStorage__queueServiceUri");
+        }
+
+        private static IReadOnlyDictionary<string, string> LoadWorkflowQueueMap()
+        {
+            var defaults = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["docintelligence"] = "workflow-docintelligence",
+                ["pii"] = "workflow-pii",
+                ["translation"] = "workflow-translation",
+                ["aivision"] = "workflow-aivision",
+                ["gptvision"] = "workflow-gptvision"
+            };
+
+            foreach (var key in defaults.Keys.ToList())
+            {
+                var envKey = $"WORKFLOW_QUEUE_{key.ToUpperInvariant()}";
+                var overrideValue = Environment.GetEnvironmentVariable(envKey);
+                if (!string.IsNullOrWhiteSpace(overrideValue))
+                {
+                    defaults[key] = overrideValue.Trim();
+                }
+            }
+
+            return defaults;
+        }
+
+        private static async Task UploadJsonAsync(BlobClient blobClient, string payload, CancellationToken cancellationToken)
+        {
+            using var ms = new MemoryStream(Encoding.UTF8.GetBytes(payload));
+            var uploadOptions = new BlobUploadOptions
+            {
+                HttpHeaders = new BlobHttpHeaders { ContentType = "application/json" }
+            };
+            await blobClient.UploadAsync(ms, uploadOptions, cancellationToken);
+        }
+
     }
 }

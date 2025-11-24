@@ -14,13 +14,32 @@ param documentIntelligenceEndpoint string
 param gptVisionEndpoint string
 param gptVisionDeploymentName string
 
-resource functionApp 'Microsoft.Web/sites@2022-09-01' = {
+resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
   name: functionAppName
   location: location
   kind: 'functionapp,linux'
   tags: tags
   properties: {
     serverFarmId: appServicePlanId
+    functionAppConfig: {
+      deployment: {
+        storage: {
+          type: 'blobContainer'
+          value: 'https://${storageAccountName}.blob.${environment().suffixes.storage}/deployments'
+          authentication: {
+            type: 'SystemAssignedIdentity'
+          }
+        }
+      }
+      scaleAndConcurrency: {
+        maximumInstanceCount: 100
+        instanceMemoryMB: 2048
+      }
+      runtime: {
+        name: 'dotnet-isolated'
+        version: '9.0'
+      }
+    }
     siteConfig: {
       cors: {
         allowedOrigins: [
@@ -71,11 +90,15 @@ resource functionApp 'Microsoft.Web/sites@2022-09-01' = {
         }
         {
           name: 'AzureWebJobsStorage__blobServiceUri'
-          value: 'https://${storageAccountName}.blob.core.windows.net/'
+          value: 'https://${storageAccountName}.blob.${environment().suffixes.storage}/'
         }
         {
           name: 'AzureWebJobsStorage__queueServiceUri'
-          value: 'https://${storageAccountName}.queue.core.windows.net/'
+          value: 'https://${storageAccountName}.queue.${environment().suffixes.storage}/'
+        }
+        {
+          name: 'AzureWebJobsStorage__tableServiceUri'
+          value: 'https://${storageAccountName}.table.${environment().suffixes.storage}/'
         }
         {
           name: 'AzureWebJobsStorage__credential'
@@ -84,6 +107,10 @@ resource functionApp 'Microsoft.Web/sites@2022-09-01' = {
         {
           name: 'FUNCTIONS_EXTENSION_VERSION'
           value: '~4'
+        }
+        {
+          name: 'SCALE_CONTROLLER_LOGGING_ENABLED'
+          value: '1'
         }
         {
           name: 'DOCUMENT_INTELLIGENCE_ENDPOINT'
@@ -97,28 +124,38 @@ resource functionApp 'Microsoft.Web/sites@2022-09-01' = {
           name: 'OPERATION_QUEUE_NAME'
           value: 'documentintelligence-events'
         }
+        {
+          name: 'DEFAULT_WORKFLOW'
+          value: 'docintelligence,pii,translation'
+        }
+        {
+          name: 'WORKFLOW_QUEUE_DOCINTELLIGENCE'
+          value: 'workflow-docintelligence'
+        }
+        {
+          name: 'WORKFLOW_QUEUE_PII'
+          value: 'workflow-pii'
+        }
+        {
+          name: 'WORKFLOW_QUEUE_TRANSLATION'
+          value: 'workflow-translation'
+        }
+        {
+          name: 'WORKFLOW_QUEUE_AIVISION'
+          value: 'workflow-aivision'
+        }
+        {
+          name: 'WORKFLOW_QUEUE_GPTVISION'
+          value: 'workflow-gptvision'
+        }
+        {
+          name: 'WORKFLOW_ALERT_QUEUE'
+          value: 'workflow-alerts'
+        }
       ]
     }
-    functionAppConfig: {
-      runtime: {
-        name: 'dotnet-isolated'
-        version: '9.0'
-      }
-      scaleAndConcurrency: {
-        instanceMemoryMB: 2048
-        maximumInstanceCount: 100
-      }
-      deployment: {
-        storage: {
-          type: 'blobContainer'
-          value: 'https://${storageAccountName}.blob.core.windows.net/deployments'
-          authentication: {
-            type: 'SystemAssignedIdentity'
-          }
-        }
-      }
-    }
     httpsOnly: true
+    reserved: true
   }
   identity: {
     type: 'SystemAssigned'

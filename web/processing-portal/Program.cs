@@ -3,15 +3,19 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using Azure;
+using Azure.Core;
+using Azure.Core.Diagnostics;
 using Azure.Identity;
 using Azure.Storage.Blobs;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using ProcessingPortal.Components;
 using ProcessingPortal.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 LoadAzdEnvironmentVariables(builder);
+EnableIdentityLogging(builder);
 
 builder.Services.AddRazorComponents()
     .AddInteractiveServerComponents();
@@ -20,12 +24,13 @@ builder.Services.Configure<StorageOptions>(builder.Configuration.GetSection("Sto
 
 
 
+builder.Services.AddSingleton<TokenCredential>(sp => CreateCredential(sp));
 builder.Services.AddSingleton(sp =>
 {
     var options = sp.GetRequiredService<IOptions<StorageOptions>>().Value;
     var configuration = sp.GetRequiredService<IConfiguration>();
+    var credential = sp.GetRequiredService<TokenCredential>();
     var serviceUri = ResolveBlobServiceUri(options, configuration);
-    var credential = new DefaultAzureCredential();
     return new BlobServiceClient(serviceUri, credential);
 });
 builder.Services.AddSingleton<IBlobStorageService, BlobStorageService>();
@@ -118,6 +123,38 @@ static Uri ResolveBlobServiceUri(StorageOptions options, IConfiguration configur
     return new Uri($"https://{accountName}.blob.core.windows.net");
 }
 
+static TokenCredential CreateCredential(IServiceProvider serviceProvider)
+{
+    var configuration = serviceProvider.GetRequiredService<IConfiguration>();
+    var logger = serviceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("Identity");
+    var environment = serviceProvider.GetRequiredService<IWebHostEnvironment>();
+
+    if (ShouldUseAzureCliCredential(configuration))
+    {
+        logger.LogInformation("Using AzureCliCredential for blob access (user identity).");
+        return new AzureCliCredential();
+    }
+
+    var options = new DefaultAzureCredentialOptions
+    {
+        ExcludeAzureCliCredential = false
+    };
+
+    // Only use managed identity when deployed to Azure, not when running locally
+    var managedIdentityClientId = GetConfigValue(configuration, "AZURE_USER_ASSIGNED_CLIENT_ID");
+    if (!string.IsNullOrWhiteSpace(managedIdentityClientId) && !environment.IsDevelopment())
+    {
+        options.ManagedIdentityClientId = managedIdentityClientId;
+        logger.LogInformation("Using DefaultAzureCredential with managed identity client ID: {ClientId}", managedIdentityClientId);
+    }
+    else
+    {
+        logger.LogInformation("Using DefaultAzureCredential for blob access (local development - will use Azure CLI or VS Code credentials).");
+    }
+
+    return new DefaultAzureCredential(options);
+}
+
 static string? GetConfigValue(IConfiguration configuration, string key)
 {
     var candidates = GenerateKeyCandidates(key).ToList();
@@ -150,6 +187,13 @@ static string? GetConfigValue(IConfiguration configuration, string key)
     return null;
 }
 
+static bool ShouldUseAzureCliCredential(IConfiguration configuration)
+{
+    return IsEnabled(configuration, "AZURE_USE_CLI_IDENTITY")
+        || IsEnabled(configuration, "Azure:UseCliIdentity")
+        || IsEnabled(configuration, "Azure__UseCliIdentity");
+}
+
 static IEnumerable<string> GenerateKeyCandidates(string key)
 {
     if (string.IsNullOrWhiteSpace(key))
@@ -172,6 +216,25 @@ static IEnumerable<string> GenerateKeyCandidates(string key)
     yield return key.ToLowerInvariant();
 }
 
+static bool IsEnabled(IConfiguration configuration, string key)
+{
+    var value = GetConfigValue(configuration, key);
+    if (string.IsNullOrWhiteSpace(value))
+    {
+        return false;
+    }
+
+    if (bool.TryParse(value, out var parsed))
+    {
+        return parsed;
+    }
+
+    return string.Equals(value, "1", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(value, "on", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(value, "enabled", StringComparison.OrdinalIgnoreCase);
+}
+
 static void LoadAzdEnvironmentVariables(WebApplicationBuilder builder)
 {
     var envValues = ReadEnvFiles(builder.Environment.ContentRootPath);
@@ -187,6 +250,28 @@ static void LoadAzdEnvironmentVariables(WebApplicationBuilder builder)
     {
         Environment.SetEnvironmentVariable(key, value);
     }
+}
+
+static void EnableIdentityLogging(WebApplicationBuilder builder)
+{
+    if (!IsIdentityLoggingEnabled(builder.Configuration))
+    {
+        return;
+    }
+
+    builder.Services.AddSingleton(sp =>
+    {
+        var logger = sp.GetRequiredService<ILoggerFactory>().CreateLogger("Identity");
+        logger.LogInformation("Azure Identity diagnostic logging enabled.");
+        return AzureEventSourceListener.CreateConsoleLogger();
+    });
+}
+
+static bool IsIdentityLoggingEnabled(IConfiguration configuration)
+{
+    return IsEnabled(configuration, "AZURE_IDENTITY_LOGGING_ENABLED")
+        || IsEnabled(configuration, "Azure:Identity:LoggingEnabled")
+        || IsEnabled(configuration, "Azure__Identity__LoggingEnabled");
 }
 
 static void AddWellKnownAliases(IDictionary<string, string> values)

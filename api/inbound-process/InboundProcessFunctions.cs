@@ -455,9 +455,9 @@ namespace InboundProcess
             try
             {
                 using var doc = JsonDocument.Parse(blobContent);
-                if (!doc.RootElement.TryGetProperty("Content", out var contentProp))
+                if (!doc.RootElement.TryGetProperty("main_content", out var contentProp))
                 {
-                    throw new InvalidOperationException("Document Intelligence output missing 'Content' property");
+                    throw new InvalidOperationException("Document Intelligence output missing 'main_content' property");
                 }
 
                 contentToAnalyze = contentProp.GetString() ?? string.Empty;
@@ -512,7 +512,7 @@ namespace InboundProcess
             {
                 reference_id = envelope.ReferenceId,
                 processor = "pii detection",
-                main_content = "PII detection completed",
+                main_content = string.Join("\n", allResults.Select(r => ((dynamic)r).redactedText)),
                 message = allResults,
                 original_filename = originalFileName,
                 origin_file = originalFileName,

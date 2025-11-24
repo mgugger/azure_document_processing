@@ -1,0 +1,619 @@
+﻿@page "/"
+@rendermode InteractiveServer
+@using System
+@using System.Collections.Generic
+@using System.IO
+@using System.Linq
+@using System.Text.Json
+@using Microsoft.AspNetCore.Components
+@using Microsoft.AspNetCore.Components.Forms
+@using Microsoft.AspNetCore.Components.Web
+@using ProcessingPortal.Services
+@inject IBlobStorageService StorageService
+
+<div class="dashboard">
+    <section class="card upload-card">
+        <header>
+            <h2>Upload Documents</h2>
+            <p>Select up to 5 files (max 200 MB each) to push into the input container.</p>
+        </header>
+
+        <div class="upload-drop">
+            <Microsoft.AspNetCore.Components.Forms.InputFile OnChange="HandleUploadAsync" Multiple="true" accept=".pdf,.jpg,.jpeg,.png,.tiff,.docx,.pptx,.txt" disabled="@_isUploading" />
+            <p>Drag and drop or click to browse.</p>
+        </div>
+
+        @if (!string.IsNullOrWhiteSpace(_uploadStatus))
+        {
+            <p class="status success">@_uploadStatus</p>
+        }
+
+        @if (!string.IsNullOrWhiteSpace(_uploadError))
+        {
+            <p class="status error">@_uploadError</p>
+        }
+    </section>
+
+    <section class="card input-card">
+        <header>
+            <div>
+                <h2>Input Files</h2>
+                <p>Items currently sitting in the input container awaiting processing.</p>
+            </div>
+            <button class="refresh" @onclick="RefreshInputsAsync" disabled="@_isLoadingInputs">
+                @(_isLoadingInputs ? "Refreshing..." : "Refresh")
+            </button>
+        </header>
+
+        @if (_isLoadingInputs)
+        {
+            <p>Loading input metadata...</p>
+        }
+        else if (!string.IsNullOrWhiteSpace(_inputsError))
+        {
+            <p class="status error">@_inputsError</p>
+        }
+        else if (_inputs.Count == 0)
+        {
+            <p>No files in the input container.</p>
+        }
+        else
+        {
+            <div class="table-wrapper blob-table">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Blob</th>
+                            <th>Size</th>
+                            <th>Uploaded</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var blob in _inputs)
+                        {
+                            <tr>
+                                <td>@blob.Name</td>
+                                <td>@FormatSize(blob.Size)</td>
+                                <td>@FormatTimestamp(blob.LastModified)</td>
+                                <td class="actions">
+                                        <button type="button" class="preview" @onclick="() => OpenInputPreviewAsync(blob.Name)">
+                                            Preview
+                                        </button>
+                                    <button type="button" class="delete" @onclick="() => DeleteInputBlobAsync(blob.Name)" disabled="@IsDeletingInput(blob.Name)">
+                                        @(IsDeletingInput(blob.Name) ? "Deleting..." : "Delete")
+                                    </button>
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+        }
+    </section>
+
+    <section class="card outputs-card">
+        <header>
+            <div>
+                <h2>Output Files</h2>
+                <p>Processed artifacts from the background pipeline.</p>
+            </div>
+            <button class="refresh" @onclick="RefreshOutputsAsync" disabled="@_isLoadingOutputs">
+                @(_isLoadingOutputs ? "Refreshing..." : "Refresh")
+            </button>
+        </header>
+
+        @if (_isLoadingOutputs)
+        {
+            <p>Loading output metadata...</p>
+        }
+        else if (!string.IsNullOrWhiteSpace(_outputsError))
+        {
+            <p class="status error">@_outputsError</p>
+        }
+        else if (_outputs.Count == 0)
+        {
+            <p>No output blobs found yet.</p>
+        }
+        else
+        {
+            <div class="table-wrapper blob-table">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Blob</th>
+                            <th>Size</th>
+                            <th>Last Modified</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var blob in _outputs)
+                        {
+                            <tr>
+                                <td>@blob.Name</td>
+                                <td>@FormatSize(blob.Size)</td>
+                                <td>@FormatTimestamp(blob.LastModified)</td>
+                                <td class="actions">
+                                        <button type="button" class="preview" @onclick="() => OpenOutputPreviewAsync(blob.Name)">
+                                            Preview
+                                        </button>
+                                        <a class="download" href="@GetDownloadUrl(blob.Name)" target="_blank" rel="noopener noreferrer">Open</a>
+                                    <button type="button" class="delete" @onclick="() => DeleteOutputBlobAsync(blob.Name)" disabled="@IsDeletingOutput(blob.Name)">
+                                        @(IsDeletingOutput(blob.Name) ? "Deleting..." : "Delete")
+                                    </button>
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+
+        }
+    </section>
+</div>
+
+@if (_isPreviewModalOpen)
+{
+    <div class="modal-backdrop" role="presentation" @onclick="ClosePreviewModal">
+        <div class="modal-panel" role="dialog" aria-modal="true" aria-label="File preview" @onclick:stopPropagation="true">
+            <header class="modal-header">
+                <div>
+                    <p class="preview-label">@(_previewModalScope?.ToUpperInvariant()) Preview</p>
+                    <h3>@(_previewModalBlobName ?? "Selected file")</h3>
+                </div>
+                <button type="button" class="modal-close" @onclick="ClosePreviewModal">Close</button>
+            </header>
+
+            @if (!string.IsNullOrWhiteSpace(_previewModalError))
+            {
+                <p class="status error">@_previewModalError</p>
+            }
+            else if (_previewModalIsText)
+            {
+                if (string.IsNullOrWhiteSpace(_previewModalTextContent))
+                {
+                    <p>No preview content available.</p>
+                }
+                else
+                {
+                    <pre>@_previewModalTextContent</pre>
+                }
+            }
+            else if (!string.IsNullOrWhiteSpace(_previewModalUrl))
+            {
+                @if (_previewFrameLoading)
+                {
+                    <p>Loading preview...</p>
+                }
+
+                <iframe class="modal-frame" src="@_previewModalUrl" title="Blob preview" @onload="HandlePreviewFrameLoaded"></iframe>
+            }
+            else
+            {
+                <p>No preview content available.</p>
+            }
+        </div>
+    </div>
+}
+
+@code {
+    private const long MaxFileSize = 1024L * 1024 * 200; // 200 MB per file
+    private const int PreviewCharacterLimit = 4000;
+    private const string InputDeleteScope = "input";
+    private const string OutputDeleteScope = "output";
+    private bool _isUploading;
+    private bool _isLoadingInputs;
+    private bool _isLoadingOutputs;
+    private string? _uploadStatus;
+    private string? _uploadError;
+    private string? _inputsError;
+    private string? _outputsError;
+    private List<BlobItemModel> _inputs = new();
+    private List<BlobItemModel> _outputs = new();
+    private bool _isPreviewModalOpen;
+    private string? _previewModalUrl;
+    private string? _previewModalBlobName;
+    private string? _previewModalScope;
+    private string? _previewModalError;
+    private bool _previewFrameLoading;
+    private bool _previewModalIsText;
+    private string? _previewModalTextContent;
+    private readonly HashSet<string> _deletingBlobs = new(StringComparer.Ordinal);
+
+    protected override async Task OnInitializedAsync()
+    {
+        await Task.WhenAll(RefreshInputsAsync(), RefreshOutputsAsync());
+    }
+
+    private async Task HandleUploadAsync(InputFileChangeEventArgs args)
+    {
+        var files = args.GetMultipleFiles(5);
+        if (files.Count == 0)
+        {
+            return;
+        }
+
+        _isUploading = true;
+        _uploadStatus = null;
+        _uploadError = null;
+
+        try
+        {
+            foreach (var file in files)
+            {
+                await using var fileStream = file.OpenReadStream(MaxFileSize);
+                await StorageService.UploadToInputAsync(file.Name, fileStream, file.ContentType ?? "application/octet-stream");
+            }
+
+            _uploadStatus = files.Count == 1
+                ? $"Uploaded {files[0].Name}"
+                : $"Uploaded {files.Count} files";
+            await RefreshInputsAsync();
+            await RefreshOutputsAsync();
+        }
+        catch (Exception ex)
+        {
+            _uploadError = $"Upload failed: {ex.Message}";
+        }
+        finally
+        {
+            _isUploading = false;
+        }
+    }
+
+    private async Task RefreshInputsAsync()
+    {
+        _isLoadingInputs = true;
+        _inputsError = null;
+        try
+        {
+            var blobs = await StorageService.ListInputBlobsAsync();
+            _inputs = blobs.ToList();
+        }
+        catch (Exception ex)
+        {
+            _inputsError = $"Failed to load inputs: {ex.Message}";
+        }
+        finally
+        {
+            _isLoadingInputs = false;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private async Task RefreshOutputsAsync()
+    {
+        _isLoadingOutputs = true;
+        _outputsError = null;
+        try
+        {
+            var blobs = await StorageService.ListOutputBlobsAsync();
+            _outputs = blobs.ToList();
+        }
+        catch (Exception ex)
+        {
+            _outputsError = $"Failed to load outputs: {ex.Message}";
+        }
+        finally
+        {
+            _isLoadingOutputs = false;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private Task OpenInputPreviewAsync(string blobName) => OpenPreviewModalAsync(
+        blobName,
+        "input",
+        GetInputPreviewUrl,
+        () => StorageService.ReadInputBlobTextAsync(blobName));
+
+    private Task OpenOutputPreviewAsync(string blobName) => OpenPreviewModalAsync(
+        blobName,
+        "output",
+        GetDownloadUrl,
+        () => StorageService.ReadOutputBlobTextAsync(blobName));
+
+    private async Task OpenPreviewModalAsync(
+        string blobName,
+        string scope,
+        Func<string, string> urlFactory,
+        Func<Task<string>> textFactory)
+    {
+        if (string.IsNullOrWhiteSpace(blobName))
+        {
+            return;
+        }
+
+        _previewModalScope = scope;
+        _previewModalBlobName = blobName;
+        _previewModalError = null;
+        _previewModalIsText = false;
+        _previewModalTextContent = null;
+        _previewModalUrl = null;
+        _previewFrameLoading = false;
+        _isPreviewModalOpen = true;
+
+        if (IsTextLikeBlob(blobName))
+        {
+            try
+            {
+                var raw = await textFactory();
+                _previewModalTextContent = BuildPreviewText(raw);
+                _previewModalIsText = true;
+            }
+            catch (Exception ex)
+            {
+                _previewModalError = $"Failed to preview '{blobName}': {ex.Message}";
+            }
+        }
+        else
+        {
+            _previewModalUrl = urlFactory(blobName);
+            _previewFrameLoading = true;
+        }
+
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private void ClosePreviewModal()
+    {
+        _isPreviewModalOpen = false;
+        _previewModalUrl = null;
+        _previewModalBlobName = null;
+        _previewModalScope = null;
+        _previewModalError = null;
+        _previewFrameLoading = false;
+        _previewModalTextContent = null;
+        _previewModalIsText = false;
+    }
+
+    private void HandlePreviewFrameLoaded()
+    {
+        _previewFrameLoading = false;
+        StateHasChanged();
+    }
+
+    private static readonly IReadOnlyList<string> PreferredContentFields = new[] { "main_content", "content" };
+
+    private static string BuildPreviewText(string rawContent)
+    {
+        if (string.IsNullOrWhiteSpace(rawContent))
+        {
+            return "No content returned.";
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(rawContent);
+            var extracted = FindContentField(document.RootElement, PreferredContentFields);
+            if (!string.IsNullOrWhiteSpace(extracted))
+            {
+                return TruncatePreview(extracted);
+            }
+        }
+        catch (JsonException)
+        {
+            // Treat as plain text fallback.
+        }
+
+        return TruncatePreview(rawContent);
+    }
+
+    private static string? FindContentField(JsonElement element, IReadOnlyList<string> fieldNames)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Object:
+                foreach (var fieldName in fieldNames)
+                {
+                    if (element.TryGetProperty(fieldName, out var candidate))
+                    {
+                        var candidateValue = CoerceElementToString(candidate);
+                        if (!string.IsNullOrWhiteSpace(candidateValue))
+                        {
+                            return candidateValue;
+                        }
+                    }
+                }
+
+                foreach (var property in element.EnumerateObject())
+                {
+                    var nestedValue = FindContentField(property.Value, fieldNames);
+                    if (!string.IsNullOrWhiteSpace(nestedValue))
+                    {
+                        return nestedValue;
+                    }
+                }
+
+                break;
+
+            case JsonValueKind.Array:
+                foreach (var item in element.EnumerateArray())
+                {
+                    var nestedValue = FindContentField(item, fieldNames);
+                    if (!string.IsNullOrWhiteSpace(nestedValue))
+                    {
+                        return nestedValue;
+                    }
+                }
+
+                break;
+
+            case JsonValueKind.String:
+                return element.GetString();
+        }
+
+        return null;
+    }
+
+    private static string CoerceElementToString(JsonElement element)
+    {
+        return element.ValueKind switch
+        {
+            JsonValueKind.String => element.GetString() ?? string.Empty,
+            JsonValueKind.Array => string.Join(
+                Environment.NewLine + Environment.NewLine,
+                element.EnumerateArray()
+                    .Select(CoerceElementToString)
+                    .Where(static value => !string.IsNullOrWhiteSpace(value))),
+            JsonValueKind.Object => element.ToString(),
+            JsonValueKind.Null => string.Empty,
+            _ => element.ToString()
+        };
+    }
+
+    private static string TruncatePreview(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return "No content returned.";
+        }
+
+        var trimmed = value.Trim();
+        if (trimmed.Length <= PreviewCharacterLimit)
+        {
+            return trimmed;
+        }
+
+        return trimmed.Substring(0, PreviewCharacterLimit) + "…";
+    }
+
+    private Task DeleteInputBlobAsync(string blobName) => DeleteBlobAsync(
+        blobName,
+        InputDeleteScope,
+        () => StorageService.DeleteInputBlobAsync(blobName),
+        RefreshInputsAsync,
+        error => _inputsError = error);
+
+    private Task DeleteOutputBlobAsync(string blobName) => DeleteBlobAsync(
+        blobName,
+        OutputDeleteScope,
+        () => StorageService.DeleteOutputBlobAsync(blobName),
+        RefreshOutputsAsync,
+        error => _outputsError = error);
+
+    private async Task DeleteBlobAsync(
+        string blobName,
+        string scope,
+        Func<Task> deleteOperation,
+        Func<Task> refreshOperation,
+        Action<string> setError)
+    {
+        if (string.IsNullOrWhiteSpace(blobName))
+        {
+            setError("Blob name is required.");
+            return;
+        }
+
+        var key = BuildDeleteKey(scope, blobName);
+        if (!_deletingBlobs.Add(key))
+        {
+            return;
+        }
+
+        try
+        {
+            await deleteOperation();
+            await refreshOperation();
+        }
+        catch (Exception ex)
+        {
+            setError($"Failed to delete '{blobName}': {ex.Message}");
+        }
+        finally
+        {
+            _deletingBlobs.Remove(key);
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private bool IsDeletingInput(string blobName) => IsDeletingBlob(blobName, InputDeleteScope);
+
+    private bool IsDeletingOutput(string blobName) => IsDeletingBlob(blobName, OutputDeleteScope);
+
+    private bool IsDeletingBlob(string blobName, string scope)
+    {
+        if (string.IsNullOrWhiteSpace(blobName))
+        {
+            return false;
+        }
+
+        var key = BuildDeleteKey(scope, blobName);
+        return _deletingBlobs.Contains(key);
+    }
+
+    private static string BuildDeleteKey(string scope, string blobName) => $"{scope}:{blobName}";
+
+    private static string FormatSize(long? size)
+    {
+        if (size is null)
+        {
+            return "-";
+        }
+
+        var units = new[] { "B", "KB", "MB", "GB" };
+        double value = size.Value;
+        var unit = 0;
+        while (value >= 1024 && unit < units.Length - 1)
+        {
+            value /= 1024;
+            unit++;
+        }
+
+        return $"{value:0.##} {units[unit]}";
+    }
+
+    private static string FormatTimestamp(DateTimeOffset? timestamp)
+    {
+        return timestamp?.ToLocalTime().ToString("g") ?? "-";
+    }
+
+    private static string GetDownloadUrl(string blobName)
+    {
+        if (string.IsNullOrWhiteSpace(blobName))
+        {
+            return "#";
+        }
+
+        var segments = blobName.Split('/', StringSplitOptions.RemoveEmptyEntries)
+            .Select(Uri.EscapeDataString);
+        var encodedPath = string.Join('/', segments);
+        var endsWithSlash = blobName.EndsWith('/') ? "/" : string.Empty;
+        return $"/api/output/{encodedPath}{endsWithSlash}";
+    }
+
+    private static string GetInputPreviewUrl(string blobName)
+    {
+        if (string.IsNullOrWhiteSpace(blobName))
+        {
+            return "#";
+        }
+
+        var segments = blobName.Split('/', StringSplitOptions.RemoveEmptyEntries)
+            .Select(Uri.EscapeDataString);
+        var encodedPath = string.Join('/', segments);
+        var endsWithSlash = blobName.EndsWith('/') ? "/" : string.Empty;
+        return $"/api/input/{encodedPath}{endsWithSlash}";
+    }
+
+    private static bool IsTextLikeBlob(string blobName)
+    {
+        if (string.IsNullOrWhiteSpace(blobName))
+        {
+            return false;
+        }
+
+        var extension = Path.GetExtension(blobName);
+        if (string.IsNullOrWhiteSpace(extension))
+        {
+            return false;
+        }
+
+        return extension.Equals(".json", StringComparison.OrdinalIgnoreCase)
+            || extension.Equals(".txt", StringComparison.OrdinalIgnoreCase)
+            || extension.Equals(".csv", StringComparison.OrdinalIgnoreCase)
+            || extension.Equals(".xml", StringComparison.OrdinalIgnoreCase)
+            || extension.Equals(".log", StringComparison.OrdinalIgnoreCase);
+    }
+}

@@ -1,0 +1,57 @@
+name: azure-document-processing
+metadata:
+  template: custom
+services:
+  function_inbound_process:
+    project: ./api/inbound-process
+    language: dotnet
+    host: function
+hooks:
+  postprovision:
+    shell: sh
+    run: |
+      azd env get-values > .env.tmp
+      cp .env.tmp ./web/processing-portal/.env.tmp
+      set -a
+      . ./.env.tmp
+      set +a
+
+      CURRENT_USER_OBJECT_ID=$(az ad signed-in-user show --query id -o tsv)
+
+      # deploy rbac assignments
+      az deployment group create \
+        --resource-group ${AZURE_RESOURCE_GROUP} \
+        --template-file infra/rbac.bicep \
+        --parameters \
+          functionInboundProcessPrincipalId=${functionInboundProcessPrincipalId} \
+          logicAppPrincipalId=${logicAppPrincipalId} \
+          storageAccountName=${storageAccountName} \
+          documentIntelligenceName=${documentIntelligenceName} \
+          documentIntelligencePrincipalId=${documentIntelligencePrincipalId} \
+          piiDetectionName=${piiDetectionName} \
+          aiVisionName=${aiVisionName} \
+          aiLanguageName=${aiLanguageName} \
+          aiTranslatorName=${aiTranslatorName} \
+          aiVisionName=${aiVisionName} \
+          gptVisionAccountName=${gptVisionAccountName} \
+          currentUserObjectId=${CURRENT_USER_OBJECT_ID}
+      
+      # ensure Event Grid subscription routes blob-created events to the inbound function
+      EVENT_SUB_NAME="${AZURE_ENV_NAME}-blobcreated-egsub"
+      FUNCTION_RESOURCE_ID="/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${AZURE_RESOURCE_GROUP}/providers/Microsoft.Web/sites/${functionInboundProcess}/functions/BlobCreatedEventGridFunction"
+      SUBJECT_PREFIX="/blobServices/default/containers/${blobContainerName}/"
+
+      if ! az eventgrid event-subscription show \
+        --name "${EVENT_SUB_NAME}" \
+        --source-resource-id "${storageAccountId}" >/dev/null 2>&1; then
+        az eventgrid event-subscription create \
+          --name "${EVENT_SUB_NAME}" \
+          --source-resource-id "${storageAccountId}" \
+          --endpoint-type azurefunction \
+          --endpoint "${FUNCTION_RESOURCE_ID}" \
+          --included-event-types Microsoft.Storage.BlobCreated \
+          --subject-begins-with "${SUBJECT_PREFIX}"
+      else
+        echo "Event Grid subscription ${EVENT_SUB_NAME} already exists."
+      fi
+      

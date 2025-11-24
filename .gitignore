@@ -1,0 +1,8 @@
+.azure
+.env.tmp
+.venv
+local.settings.json
+obj
+release
+bin
+.vscode

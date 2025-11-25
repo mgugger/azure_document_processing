@@ -15,10 +15,10 @@
       "name": "reference_id",
       "type": "Edm.String",
       "key": false,
-      "searchable": false,
+      "searchable": true,
       "filterable": true,
-      "sortable": false,
-      "facetable": false,
+      "sortable": true,
+      "facetable": true,
       "retrievable": true
     },
     {

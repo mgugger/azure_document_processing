@@ -10,7 +10,8 @@
     "maxFailedItems": 0,
     "maxFailedItemsPerBatch": 0,
     "configuration": {
-      "parsingMode": "json"
+      "parsingMode": "json",
+      "indexedFileNameExtensions": ".json"
     }
   },
   "fieldMappings": []

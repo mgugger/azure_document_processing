@@ -34,6 +34,7 @@ hooks:
           aiTranslatorName=${aiTranslatorName} \
           aiVisionName=${aiVisionName} \
           gptVisionAccountName=${gptVisionAccountName} \
+          gptSpellAccountName=${gptSpellAccountName} \
           currentUserObjectId=${CURRENT_USER_OBJECT_ID}
       
       # ensure Event Grid subscription routes blob-created events to the inbound function

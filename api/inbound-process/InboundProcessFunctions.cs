@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -13,6 +15,7 @@ using Azure.AI.OpenAI;
 using Azure.AI.TextAnalytics;
 using Azure.AI.Translation.Text;
 using Azure.AI.Vision.ImageAnalysis;
+using Azure.Core;
 using Azure.Identity;
 using Azure.Messaging.EventGrid;
 using Azure.Storage.Blobs;
@@ -91,11 +94,16 @@ namespace InboundProcess
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
             WriteIndented = false
         };
+        private static readonly HttpClient SharedHttpClient = new();
 
         private const string ReferenceIdMetadataKey = "reference_id";
         private const string WorkflowStepsMetadataKey = "workflow_steps";
         private const string InputContainerName = "input";
         private const string OutputContainerName = "output";
+        private const string CognitiveServicesScope = "https://cognitiveservices.azure.com/.default";
+        private const int LanguageDetectionSampleLength = 4000; // stay under service limit (5120 text elements)
+        private const string LatestOutputPathMetadataKey = "latest-output-path";
+        private const string LatestOutputStepMetadataKey = "latest-output-step";
 
         public InboundProcessFunctions(ILoggerFactory loggerFactory)
         {
@@ -199,6 +207,12 @@ namespace InboundProcess
             FunctionContext context) =>
             await ExecuteWorkflowStepAsync("translation", message, context, RunTranslationStepAsync);
 
+        [Function("WorkflowSpellCheckStep")]
+        public async Task WorkflowSpellCheckStep(
+            [QueueTrigger("%WORKFLOW_QUEUE_SPELLCHECK%", Connection = "AzureWebJobsStorage")] string message,
+            FunctionContext context) =>
+            await ExecuteWorkflowStepAsync("spellcheck", message, context, RunSpellCheckStepAsync);
+
         [Function("WorkflowPdfImagesStep")]
         public async Task WorkflowPdfImagesStep(
             [QueueTrigger("%WORKFLOW_QUEUE_PDFIMAGES%", Connection = "AzureWebJobsStorage")] string message,
@@ -298,7 +312,7 @@ namespace InboundProcess
 
             await UploadJsonAsync(blobClient, docJson, cancellationToken);
 
-            diMessage.Workflow.Metadata["documentintelligence-output"] = outputBlobPath;
+                RecordStepOutput(diMessage.Workflow, "docintelligence", outputBlobPath);
             await AdvanceWorkflowAsync(diMessage.Workflow, cancellationToken);
         }
 
@@ -363,27 +377,12 @@ namespace InboundProcess
 
         private async Task RunTranslationStepAsync(WorkflowEnvelope envelope, CancellationToken cancellationToken)
         {
-            var blobClient = GetBlobClientForPath(envelope.BlobPath);
-            string textContent;
-            try
-            {
-                var download = await blobClient.DownloadAsync(cancellationToken: cancellationToken);
-                using var reader = new StreamReader(download.Value.Content);
-                textContent = await reader.ReadToEndAsync();
-            }
-            catch (Exception ex)
-            {
-                throw new InvalidOperationException($"Failed to read blob content: {ex.Message}");
-            }
-
-            var hasMainContent = TryExtractMainContent(textContent, out var mainContent) && !string.IsNullOrWhiteSpace(mainContent);
-            var translationInput = hasMainContent ? mainContent : textContent;
+            var translationInput = await ResolveTextInputAsync(envelope, cancellationToken);
             if (string.IsNullOrWhiteSpace(translationInput))
             {
                 throw new InvalidOperationException("No content available to translate");
             }
 
-            const int LanguageDetectionSampleLength = 4000; // stay under service limit (5120 text elements)
             var languageEndpoint = GetRequiredSetting("AI_LANGUAGE_ENDPOINT");
             var textAnalyticsClient = new TextAnalyticsClient(new Uri(languageEndpoint), new DefaultAzureCredential());
             string language;
@@ -468,7 +467,87 @@ namespace InboundProcess
 
             await UploadJsonAsync(outputBlobClient, outputJson, cancellationToken);
 
-            envelope.Metadata[$"{outputTypeFolder}-output"] = outputBlobPath;
+            RecordStepOutput(envelope, "translation", outputBlobPath);
+            await AdvanceWorkflowAsync(envelope, cancellationToken);
+        }
+
+        private async Task RunSpellCheckStepAsync(WorkflowEnvelope envelope, CancellationToken cancellationToken)
+        {
+            var spellcheckInput = await ResolveTextInputAsync(envelope, cancellationToken);
+            if (string.IsNullOrWhiteSpace(spellcheckInput))
+            {
+                throw new InvalidOperationException("No content available to spell check");
+            }
+
+            var languageEndpoint = GetRequiredSetting("AI_LANGUAGE_ENDPOINT");
+            var textAnalyticsClient = new TextAnalyticsClient(new Uri(languageEndpoint), new DefaultAzureCredential());
+            string language;
+            try
+            {
+                var sampleLength = Math.Min(LanguageDetectionSampleLength, spellcheckInput.Length);
+                var detectionSample = sampleLength == spellcheckInput.Length
+                    ? spellcheckInput
+                    : spellcheckInput[..sampleLength];
+                var response = await textAnalyticsClient.DetectLanguageAsync(detectionSample, cancellationToken: cancellationToken);
+                language = string.IsNullOrWhiteSpace(response.Value.Iso6391Name) ? "en" : response.Value.Iso6391Name;
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException($"Failed to detect language: {ex.Message}");
+            }
+
+            var spellCheckEndpoint = GetRequiredSetting("GPT5_SPELLCHECK_ENDPOINT");
+            var spellCheckDeployment = GetRequiredSetting("GPT5_SPELLCHECK_DEPLOYMENT_NAME");
+
+            SpellCheckResult spellCheckResult;
+            try
+            {
+                spellCheckResult = await RunSpellCheckWithOpenAiAsync(
+                    spellcheckInput,
+                    language,
+                    spellCheckEndpoint,
+                    spellCheckDeployment,
+                    cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException($"Failed to run spell check: {ex.Message}");
+            }
+
+            var correctedText = spellCheckResult.CorrectedText;
+            var wasCorrected = !string.Equals(correctedText, spellcheckInput, StringComparison.Ordinal);
+            var originalFileName = Path.GetFileName(envelope.BlobPath);
+            var outputTypeFolder = "spellcheck";
+            var outputFileName = $"{originalFileName}_spellchecked.json";
+            var outputBlobPath = $"{outputTypeFolder}/{outputFileName}";
+            var documentId = BuildDocumentId(outputFileName);
+
+            var containerClient = _blobServiceClient.GetBlobContainerClient(OutputContainerName);
+            await containerClient.CreateIfNotExistsAsync(cancellationToken: cancellationToken);
+            var outputBlobClient = containerClient.GetBlobClient(outputBlobPath);
+
+            var payload = new
+            {
+                document_id = documentId,
+                reference_id = envelope.ReferenceId,
+                processor = wasCorrected ? "spellcheck" : "spellcheck passthrough",
+                main_content = correctedText,
+                message = new
+                {
+                    corrected_text = correctedText,
+                    language,
+                    model = spellCheckDeployment,
+                    response = spellCheckResult.RawResponse
+                },
+                original_filename = originalFileName,
+                origin_file = originalFileName,
+                folderName = outputTypeFolder
+            };
+
+            var outputJson = JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true });
+            await UploadJsonAsync(outputBlobClient, outputJson, cancellationToken);
+
+            RecordStepOutput(envelope, "spellcheck", outputBlobPath);
             await AdvanceWorkflowAsync(envelope, cancellationToken);
         }
 
@@ -581,40 +660,7 @@ namespace InboundProcess
 
         private async Task RunPiiStepAsync(WorkflowEnvelope envelope, CancellationToken cancellationToken)
         {
-            if (!envelope.Metadata.TryGetValue("documentintelligence-output", out var docIntPath) || string.IsNullOrWhiteSpace(docIntPath))
-            {
-                throw new InvalidOperationException("Document Intelligence output path not found in workflow metadata");
-            }
-
-            var containerClient = _blobServiceClient.GetBlobContainerClient(OutputContainerName);
-            var sourceBlob = containerClient.GetBlobClient(docIntPath);
-            string blobContent;
-            try
-            {
-                var download = await sourceBlob.DownloadContentAsync(cancellationToken);
-                blobContent = download.Value.Content.ToString();
-            }
-            catch (Exception ex)
-            {
-                throw new InvalidOperationException($"Failed to read Document Intelligence output '{docIntPath}': {ex.Message}");
-            }
-
-            string contentToAnalyze;
-            try
-            {
-                using var doc = JsonDocument.Parse(blobContent);
-                if (!doc.RootElement.TryGetProperty("main_content", out var contentProp))
-                {
-                    throw new InvalidOperationException("Document Intelligence output missing 'main_content' property");
-                }
-
-                contentToAnalyze = contentProp.GetString() ?? string.Empty;
-            }
-            catch (Exception ex) when (ex is JsonException or InvalidOperationException)
-            {
-                throw new InvalidOperationException($"Invalid Document Intelligence output JSON: {ex.Message}");
-            }
-
+            var contentToAnalyze = await ResolveTextInputAsync(envelope, cancellationToken);
             if (string.IsNullOrWhiteSpace(contentToAnalyze))
             {
                 throw new InvalidOperationException("No content found to analyze for PII");
@@ -650,7 +696,9 @@ namespace InboundProcess
                 }
             }
 
-            var originalFileName = Path.GetFileName(docIntPath);
+            var containerClient = _blobServiceClient.GetBlobContainerClient(OutputContainerName);
+            var currentInputPath = ResolveCurrentInputBlobPath(envelope);
+            var originalFileName = Path.GetFileName(currentInputPath);
             var outputTypeFolder = "pii_detection";
             var outputFileName = $"{originalFileName}_pii_detection_result.json";
             var outputPath = $"{outputTypeFolder}/{outputFileName}";
@@ -671,7 +719,7 @@ namespace InboundProcess
 
             await UploadJsonAsync(resultBlobClient, outputJson, cancellationToken);
 
-            envelope.Metadata["pii-output"] = outputPath;
+            RecordStepOutput(envelope, "pii", outputPath);
             await AdvanceWorkflowAsync(envelope, cancellationToken);
         }
 
@@ -724,7 +772,7 @@ namespace InboundProcess
 
             await UploadJsonAsync(outputBlobClient, visionOutputJson, cancellationToken);
 
-            envelope.Metadata["aivision-output"] = outputBlobPath;
+            RecordStepOutput(envelope, "aivision", outputBlobPath);
             await AdvanceWorkflowAsync(envelope, cancellationToken);
         }
 
@@ -784,7 +832,7 @@ namespace InboundProcess
 
             await UploadJsonAsync(outputBlobClient, outputJson, cancellationToken);
 
-            envelope.Metadata["gptvision-output"] = outputBlobPath;
+            RecordStepOutput(envelope, "gptvision", outputBlobPath);
             await AdvanceWorkflowAsync(envelope, cancellationToken);
         }
 
@@ -962,6 +1010,74 @@ namespace InboundProcess
 
         private Uri BuildBlobUri(string blobPath) => new(_blobServiceClient.Uri, blobPath);
 
+        private void RecordStepOutput(WorkflowEnvelope envelope, string stepKey, string relativeOutputPath)
+        {
+            if (envelope is null || string.IsNullOrWhiteSpace(stepKey) || string.IsNullOrWhiteSpace(relativeOutputPath))
+            {
+                return;
+            }
+
+            envelope.Metadata[$"{stepKey}-output"] = relativeOutputPath;
+
+            var qualifiedPath = relativeOutputPath.StartsWith("input/", StringComparison.OrdinalIgnoreCase) ||
+                                relativeOutputPath.StartsWith("output/", StringComparison.OrdinalIgnoreCase)
+                ? relativeOutputPath
+                : $"{OutputContainerName}/{relativeOutputPath.TrimStart('/')}";
+
+            envelope.Metadata[LatestOutputPathMetadataKey] = qualifiedPath;
+            envelope.Metadata[LatestOutputStepMetadataKey] = stepKey;
+        }
+
+        private string ResolveCurrentInputBlobPath(WorkflowEnvelope envelope)
+        {
+            if (envelope.Metadata.TryGetValue(LatestOutputPathMetadataKey, out var latestPath) && !string.IsNullOrWhiteSpace(latestPath))
+            {
+                return latestPath;
+            }
+
+            return envelope.BlobPath;
+        }
+
+        private async Task<string> ResolveTextInputAsync(WorkflowEnvelope envelope, CancellationToken cancellationToken)
+        {
+            if (envelope.Metadata.TryGetValue(LatestOutputPathMetadataKey, out var latestPath) && !string.IsNullOrWhiteSpace(latestPath))
+            {
+                var latestClient = GetBlobClientForPath(latestPath);
+                try
+                {
+                    var latestPayload = await DownloadBlobTextAsync(latestClient, cancellationToken);
+                    if (TryExtractMainContent(latestPayload, out var latestMainContent) && !string.IsNullOrWhiteSpace(latestMainContent))
+                    {
+                        return latestMainContent;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(latestPayload))
+                    {
+                        return latestPayload;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to read latest workflow output {LatestPath}; falling back to original blob", latestPath);
+                }
+            }
+
+            var originalClient = GetBlobClientForPath(envelope.BlobPath);
+            var originalPayload = await DownloadBlobTextAsync(originalClient, cancellationToken);
+            if (TryExtractMainContent(originalPayload, out var originalMainContent) && !string.IsNullOrWhiteSpace(originalMainContent))
+            {
+                return originalMainContent;
+            }
+
+            return originalPayload;
+        }
+
+        private static async Task<string> DownloadBlobTextAsync(BlobClient blobClient, CancellationToken cancellationToken)
+        {
+            var download = await blobClient.DownloadContentAsync(cancellationToken);
+            return download.Value.Content.ToString();
+        }
+
         private static string GetRequiredSetting(string key)
         {
             var value = Environment.GetEnvironmentVariable(key);
@@ -1031,6 +1147,7 @@ namespace InboundProcess
                 ["docintelligence"] = "workflow-docintelligence",
                 ["pii"] = "workflow-pii",
                 ["translation"] = "workflow-translation",
+                ["spellcheck"] = "workflow-spellcheck",
                 ["aivision"] = "workflow-aivision",
                 ["gptvision"] = "workflow-gptvision",
                 ["pdfimages"] = "workflow-pdfimages"
@@ -1168,6 +1285,125 @@ namespace InboundProcess
                 yield return text.Substring(index, Math.Min(chunkSize, text.Length - index));
             }
         }
+        
+        private async Task<SpellCheckResult> RunSpellCheckWithOpenAiAsync(
+            string text,
+            string language,
+            string endpoint,
+            string deployment,
+            CancellationToken cancellationToken)
+        {
+            var client = new AzureOpenAIClient(new Uri(endpoint), new DefaultAzureCredential());
+            var chatClient = client.GetChatClient(deployment);
+
+            var messages = new ChatMessage[]
+            {
+                new SystemChatMessage("You are a meticulous proofreader. Return JSON with 'corrected_text' and optional 'changes' describing edits. Preserve the original structure, fix spelling/spacing/grammar, and automatically resolve logical inconsistencies or perspective issues so the text remains coherent."),
+                new UserChatMessage($"Language: {language}\\n\\nText:\\n{text}")
+            };
+
+            const int MaxAttempts = 4;
+            var throttled = false;
+            RequestFailedException lastRequestFailure = null!;
+
+            for (var attempt = 1; attempt <= MaxAttempts; attempt++)
+            {
+                try
+                {
+                    var completion = await chatClient.CompleteChatAsync(
+                        messages,
+                        new ChatCompletionOptions
+                        {
+                            Temperature = 0,
+                            MaxOutputTokenCount = 2048
+                        },
+                        cancellationToken);
+
+                    var responseText = string.Concat(completion.Value.Content.Select(part => part.Text));
+                    return ParseSpellCheckResponse(responseText, text);
+                }
+                catch (RequestFailedException ex) when (ex.Status == 429 && attempt < MaxAttempts)
+                {
+                    throttled = true;
+                    lastRequestFailure = ex;
+                    var delaySeconds = Math.Pow(2, attempt); // 2s, 4s, 8s
+                    _logger.LogWarning(ex, "Spell check throttled (attempt {Attempt}/{MaxAttempts}). Retrying in {DelaySeconds}s.", attempt, MaxAttempts, delaySeconds);
+                    await Task.Delay(TimeSpan.FromSeconds(delaySeconds), cancellationToken);
+                }
+                catch (RequestFailedException ex)
+                {
+                    throw new InvalidOperationException($"Spell check request failed: {ex.Message}", ex);
+                }
+            }
+
+            if (throttled)
+            {
+                throw new InvalidOperationException(
+                    $"Spell check request failed after retries: {lastRequestFailure.Message}",
+                    lastRequestFailure);
+            }
+
+            throw new InvalidOperationException("Spell check request failed after retries");
+        }
+
+        private static SpellCheckResult ParseSpellCheckResponse(string content, string fallbackText)
+        {
+            if (string.IsNullOrWhiteSpace(content))
+            {
+                return new SpellCheckResult(fallbackText, default);
+            }
+
+            var normalized = StripMarkdownCodeFences(content.Trim());
+
+            try
+            {
+                using var document = JsonDocument.Parse(normalized);
+                var root = document.RootElement.Clone();
+                var corrected = root.TryGetProperty("corrected_text", out var correctedProperty) && correctedProperty.ValueKind == JsonValueKind.String
+                    ? correctedProperty.GetString() ?? fallbackText
+                    : fallbackText;
+
+                return new SpellCheckResult(corrected, root);
+            }
+            catch (JsonException)
+            {
+                return new SpellCheckResult(normalized, default);
+            }
+        }
+
+        private static string StripMarkdownCodeFences(string content)
+        {
+            if (!content.StartsWith("```", StringComparison.Ordinal))
+            {
+                return content;
+            }
+
+            var closingFence = content.LastIndexOf("```", StringComparison.Ordinal);
+            if (closingFence <= 0)
+            {
+                return content.Trim('`');
+            }
+
+            var firstLineBreak = content.IndexOf('\n');
+            if (firstLineBreak < 0)
+            {
+                firstLineBreak = content.IndexOf('\r');
+            }
+
+            if (firstLineBreak < 0)
+            {
+                return content.Trim('`');
+            }
+
+            var start = firstLineBreak + 1;
+            var length = closingFence - start;
+            if (length <= 0)
+            {
+                return content.Trim('`');
+            }
+
+            return content.Substring(start, length).Trim();
+        }
 
         private static bool TryMaterializePdfImage(IPdfImage pdfImage, out byte[] bytes, out string contentType, out string fileExtension)
         {
@@ -1258,6 +1494,7 @@ namespace InboundProcess
         }
 
         private sealed record ExtractedPdfImage(byte[] Bytes, int PageNumber, int IndexOnPage, string ContentType, string FileExtension);
+        private sealed record SpellCheckResult(string CorrectedText, JsonElement RawResponse);
 
     }
 }

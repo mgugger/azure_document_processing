@@ -60,6 +60,10 @@ resource workflowTranslationQueue 'Microsoft.Storage/storageAccounts/queueServic
   name: '${storageAccount.name}/default/workflow-translation'
 }
 
+resource workflowSpellCheckQueue 'Microsoft.Storage/storageAccounts/queueServices/queues@2022-09-01' = {
+  name: '${storageAccount.name}/default/workflow-spellcheck'
+}
+
 resource workflowAIVisionQueue 'Microsoft.Storage/storageAccounts/queueServices/queues@2022-09-01' = {
   name: '${storageAccount.name}/default/workflow-aivision'
 }

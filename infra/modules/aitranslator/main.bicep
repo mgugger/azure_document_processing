@@ -22,5 +22,5 @@ resource aiTranslator 'Microsoft.CognitiveServices/accounts@2025-06-01' = {
 
 output aiTranslatorName string = aiTranslator.name
 output resourceId string = aiTranslator.id
-output endpoint string = aiTranslator.properties.endpoint
+output endpoint string = 'https://${aiTranslator.name}.cognitiveservices.azure.com/'
 output principalId string = aiTranslator.identity.principalId

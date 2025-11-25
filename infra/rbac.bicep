@@ -17,6 +17,7 @@ param cognitiveServicesContributorRoleId string = '25fbc0a9-bd7c-42a3-aa1a-3b75d
 param cognitiveServicesUserRoleId string = 'a97b65f3-24c7-4388-baec-2e87135dc908'
 param storageBlobDataReaderRoleId string = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
 param gptVisionAccountName string
+param gptSpellAccountName string
 param currentUserObjectId string
 
 resource storageAccount 'Microsoft.Storage/storageAccounts@2022-09-01' existing = {
@@ -45,6 +46,10 @@ resource aiTranslator 'Microsoft.CognitiveServices/accounts@2025-06-01' existing
 
 resource gptvision 'Microsoft.CognitiveServices/accounts@2024-10-01' existing = {
   name: gptVisionAccountName 
+}
+
+resource gptspell 'Microsoft.CognitiveServices/accounts@2024-10-01' existing = {
+  name: gptSpellAccountName
 }
 
 // Cognitive Services User role for AI Language
@@ -190,6 +195,17 @@ resource storage_blob_reader_docintelligence 'Microsoft.Authorization/roleAssign
 resource gptvision_user_rbac_inbound 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(gptvision.id, functionInboundProcessPrincipalId, cognitiveServicesUserRoleId)
   scope: gptvision
+  properties: {
+    principalId: functionInboundProcessPrincipalId
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', cognitiveServicesUserRoleId)
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// Cognitive Services User role for GPT5 spell check
+resource gptspell_user_rbac_inbound 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(gptspell.id, functionInboundProcessPrincipalId, cognitiveServicesUserRoleId)
+  scope: gptspell
   properties: {
     principalId: functionInboundProcessPrincipalId
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', cognitiveServicesUserRoleId)

@@ -9,6 +9,11 @@ param aiLanguageName string = uniqueString(resourceGroup().id, 'ailanguage')
 param aiTranslatorName string = uniqueString(resourceGroup().id, 'aitranslator')
 param gptVisionAccountName string = uniqueString(resourceGroup().id, 'gptvision')
 param gptVisionDeploymentName string = 'gpt-4-vision'
+param gptSpellAccountName string = uniqueString(resourceGroup().id, 'gptspell')
+param gptSpellDeploymentName string = 'gpt5-mini'
+param gptSpellModelName string = 'gpt-4o-mini'
+param gptSpellModelVersion string = '2024-07-18'
+param gptSpellCapacity int = 2
 
 module ailanguage './modules/ailanguage/main.bicep' = {
   name: 'aiLanguageModule'
@@ -67,6 +72,8 @@ module function_inbound_process './modules/function/main.bicep' = {
     appInsightsConnectionString: appinsights.outputs.connectionString
     gptVisionDeploymentName: gptvision.outputs.deploymentName
     gptVisionEndpoint: gptvision.outputs.endpoint
+    gptSpellDeploymentName: gptspell.outputs.deploymentName
+    gptSpellEndpoint: gptspell.outputs.endpoint
     tags: {
         'azd-service-name': 'function_inbound_process'
     }
@@ -103,6 +110,18 @@ module gptvision './modules/gptvision/main.bicep' = {
     location: location
     accountName: gptVisionAccountName
     deploymentName: gptVisionDeploymentName
+  }
+}
+
+module gptspell './modules/gptspell/main.bicep' = {
+  name: 'gptSpellModule'
+  params: {
+    location: location
+    accountName: gptSpellAccountName
+    deploymentName: gptSpellDeploymentName
+    modelName: gptSpellModelName
+    modelVersion: gptSpellModelVersion
+    skuCapacity: gptSpellCapacity
   }
 }
 
@@ -152,6 +171,9 @@ output aiTranslatorEndpoint string = aitranslator.outputs.endpoint
 output gptVisionEndpoint string = gptvision.outputs.endpoint
 output gptVisionDeploymentName string = gptvision.outputs.deploymentName
 output gptVisionAccountName string = gptvision.outputs.accountName
+output gptSpellEndpoint string = gptspell.outputs.endpoint
+output gptSpellDeploymentName string = gptspell.outputs.deploymentName
+output gptSpellAccountName string = gptspell.outputs.accountName
 output aiSearchServiceName string = aisearch.outputs.searchServiceName
 output aiSearchOutputDataSourceName string = aisearch.outputs.processedOutputDataSourceName
 output aiSearchOutputIndexName string = aisearch.outputs.processedOutputIndexName

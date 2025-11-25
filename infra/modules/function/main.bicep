@@ -13,6 +13,8 @@ param tags object
 param documentIntelligenceEndpoint string
 param gptVisionEndpoint string
 param gptVisionDeploymentName string
+param gptSpellEndpoint string
+param gptSpellDeploymentName string
 
 resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
   name: functionAppName
@@ -63,6 +65,14 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
         {
           name: 'GPT4_VISION_DEPLOYMENT_NAME'
           value: split(gptVisionDeploymentName, '/')[1]
+        }
+        {
+          name: 'GPT5_SPELLCHECK_ENDPOINT'
+          value: gptSpellEndpoint
+        }
+        {
+          name: 'GPT5_SPELLCHECK_DEPLOYMENT_NAME'
+          value: split(gptSpellDeploymentName, '/')[1]
         }
         {
           name: 'PII_DETECTION_ENDPOINT'
@@ -126,7 +136,7 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
         }
         {
           name: 'DEFAULT_WORKFLOW'
-          value: 'docintelligence,pii,translation'
+          value: 'docintelligence,spellcheck,pii,translation'
         }
         {
           name: 'WORKFLOW_QUEUE_DOCINTELLIGENCE'
@@ -139,6 +149,10 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
         {
           name: 'WORKFLOW_QUEUE_TRANSLATION'
           value: 'workflow-translation'
+        }
+        {
+          name: 'WORKFLOW_QUEUE_SPELLCHECK'
+          value: 'workflow-spellcheck'
         }
         {
           name: 'WORKFLOW_QUEUE_AIVISION'

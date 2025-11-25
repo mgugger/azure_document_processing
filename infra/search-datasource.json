@@ -1,0 +1,15 @@
+{
+  "name": "__DATA_SOURCE_NAME__",
+  "type": "azureblob",
+  "credentials": {
+    "connectionString": "ResourceId=__STORAGE_RESOURCE_ID__;Credential=systemAssigned"
+  },
+  "container": {
+    "name": "__OUTPUT_CONTAINER_NAME__"
+  },
+  "dataChangeDetectionPolicy": {
+    "@odata.type": "#Microsoft.Azure.Search.HighWaterMarkChangeDetectionPolicy",
+    "highWaterMarkColumnName": "metadata_storage_last_modified"
+  },
+  "dataDeletionDetectionPolicy": null
+}

@@ -1,0 +1,16 @@
+{
+  "name": "__INDEXER_NAME__",
+  "dataSourceName": "__DATA_SOURCE_NAME__",
+  "targetIndexName": "__INDEX_NAME__",
+  "schedule": {
+    "interval": "PT5M"
+  },
+  "parameters": {
+    "maxFailedItems": 0,
+    "maxFailedItemsPerBatch": 0,
+    "configuration": {
+      "parsingMode": "json"
+    }
+  },
+  "fieldMappings": []
+}

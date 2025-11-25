@@ -122,9 +122,8 @@ module aisearch './modules/aisearch/main.bicep' = {
   params: {
     location: location
     searchServiceName: aiSearchServiceName
-    //storageConnectionString: storage.outputs.storageConnectionString
-    //inputContainerName: 'input'
-    //outputContainerName: 'output'
+    storageAccountName: storage.outputs.storageAccountName
+    outputContainerName: 'output'
   }
 }
 
@@ -153,3 +152,9 @@ output aiTranslatorEndpoint string = aitranslator.outputs.endpoint
 output gptVisionEndpoint string = gptvision.outputs.endpoint
 output gptVisionDeploymentName string = gptvision.outputs.deploymentName
 output gptVisionAccountName string = gptvision.outputs.accountName
+output aiSearchServiceName string = aisearch.outputs.searchServiceName
+output aiSearchOutputDataSourceName string = aisearch.outputs.processedOutputDataSourceName
+output aiSearchOutputIndexName string = aisearch.outputs.processedOutputIndexName
+output aiSearchOutputIndexerName string = aisearch.outputs.processedOutputIndexerName
+output aiSearchOutputContainerName string = aisearch.outputs.processedOutputContainerName
+output aiSearchServicePrincipalId string = aisearch.outputs.searchServicePrincipalId

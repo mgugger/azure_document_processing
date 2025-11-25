@@ -54,4 +54,74 @@ hooks:
       else
         echo "Event Grid subscription ${EVENT_SUB_NAME} already exists."
       fi
+
+      SEARCH_API_VERSION="2023-11-01"
+      SEARCH_SERVICE_NAME="${aiSearchServiceName}"
+      SEARCH_BASE_URL="https://${SEARCH_SERVICE_NAME}.search.windows.net"
+      SEARCH_DATASOURCE_NAME="${aiSearchOutputDataSourceName}"
+      SEARCH_INDEX_NAME="${aiSearchOutputIndexName}"
+      SEARCH_INDEXER_NAME="${aiSearchOutputIndexerName}"
+      SEARCH_OUTPUT_CONTAINER="${aiSearchOutputContainerName:-output}"
+
+      if [ -n "${SEARCH_SERVICE_NAME}" ]; then
+        STORAGE_RESOURCE_ID="${storageAccountId}"
+        SEARCH_ADMIN_KEY=$(az search admin-key show \
+          --resource-group "${AZURE_RESOURCE_GROUP}" \
+          --service-name "${SEARCH_SERVICE_NAME}" \
+          --query primaryKey -o tsv)
+
+        if [ -z "${SEARCH_ADMIN_KEY}" ]; then
+          echo "Unable to retrieve Azure AI Search admin key; skipping data plane resource configuration" >&2
+        else
+          if [ -n "${SEARCH_DATASOURCE_NAME}" ]; then
+            SEARCH_DATASOURCE_URL="${SEARCH_BASE_URL}/datasources/${SEARCH_DATASOURCE_NAME}?api-version=${SEARCH_API_VERSION}"
+
+            if ! az rest --method get --url "${SEARCH_DATASOURCE_URL}" --headers "api-key=${SEARCH_ADMIN_KEY}" --skip-authorization-header >/dev/null 2>&1; then
+              echo "Creating Azure AI Search data source ${SEARCH_DATASOURCE_NAME}..."
+              jq \
+                --arg ds "${SEARCH_DATASOURCE_NAME}" \
+                --arg rid "${STORAGE_RESOURCE_ID}" \
+                --arg container "${SEARCH_OUTPUT_CONTAINER}" \
+                '(.name = $ds)
+                 | (.credentials.connectionString = "ResourceId=" + $rid + ";Credential=systemAssigned")
+                 | (.container.name = $container)' \
+                infra/search-datasource.json \
+                | az rest --method put --url "${SEARCH_DATASOURCE_URL}" --headers "Content-Type=application/json" "api-key=${SEARCH_ADMIN_KEY}" --skip-authorization-header --body @-
+            else
+              echo "Azure AI Search data source ${SEARCH_DATASOURCE_NAME} already exists."
+            fi
+          fi
+
+          if [ -n "${SEARCH_INDEX_NAME}" ]; then
+            SEARCH_INDEX_URL="${SEARCH_BASE_URL}/indexes/${SEARCH_INDEX_NAME}?api-version=${SEARCH_API_VERSION}"
+
+            if ! az rest --method get --url "${SEARCH_INDEX_URL}" --headers "api-key=${SEARCH_ADMIN_KEY}" --skip-authorization-header >/dev/null 2>&1; then
+              echo "Creating Azure AI Search index ${SEARCH_INDEX_NAME}..."
+              jq --arg idx "${SEARCH_INDEX_NAME}" '(.name = $idx)' infra/search-index.json \
+                | az rest --method put --url "${SEARCH_INDEX_URL}" --headers "Content-Type=application/json" "api-key=${SEARCH_ADMIN_KEY}" --skip-authorization-header --body @-
+            else
+              echo "Azure AI Search index ${SEARCH_INDEX_NAME} already exists."
+            fi
+          fi
+
+          if [ -n "${SEARCH_DATASOURCE_NAME}" ] && [ -n "${SEARCH_INDEX_NAME}" ] && [ -n "${SEARCH_INDEXER_NAME}" ]; then
+            SEARCH_INDEXER_URL="${SEARCH_BASE_URL}/indexers/${SEARCH_INDEXER_NAME}?api-version=${SEARCH_API_VERSION}"
+
+            if ! az rest --method get --url "${SEARCH_INDEXER_URL}" --headers "api-key=${SEARCH_ADMIN_KEY}" --skip-authorization-header >/dev/null 2>&1; then
+              echo "Creating Azure AI Search indexer ${SEARCH_INDEXER_NAME}..."
+              jq \
+                --arg idx "${SEARCH_INDEX_NAME}" \
+                --arg ids "${SEARCH_DATASOURCE_NAME}" \
+                --arg name "${SEARCH_INDEXER_NAME}" \
+                '(.name = $name)
+                 | (.targetIndexName = $idx)
+                 | (.dataSourceName = $ids)' \
+                infra/search-indexer.json \
+                | az rest --method put --url "${SEARCH_INDEXER_URL}" --headers "Content-Type=application/json" "api-key=${SEARCH_ADMIN_KEY}" --skip-authorization-header --body @-
+            else
+              echo "Azure AI Search indexer ${SEARCH_INDEXER_NAME} already exists."
+            fi
+          fi
+        fi
+      fi
       

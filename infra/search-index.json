@@ -2,9 +2,19 @@
   "name": "__INDEX_NAME__",
   "fields": [
     {
-      "name": "reference_id",
+      "name": "document_id",
       "type": "Edm.String",
       "key": true,
+      "searchable": false,
+      "filterable": true,
+      "sortable": true,
+      "facetable": false,
+      "retrievable": true
+    },
+    {
+      "name": "reference_id",
+      "type": "Edm.String",
+      "key": false,
       "searchable": false,
       "filterable": true,
       "sortable": false,
@@ -21,12 +31,21 @@
       "retrievable": true
     },
     {
-      "name": "file_name",
+      "name": "origin_file",
       "type": "Edm.String",
       "searchable": true,
       "filterable": true,
       "sortable": true,
       "facetable": false,
+      "retrievable": true
+    },
+    {
+      "name": "processor",
+      "type": "Edm.String",
+      "searchable": false,
+      "filterable": true,
+      "sortable": true,
+      "facetable": true,
       "retrievable": true
     }
   ]

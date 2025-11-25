@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -20,6 +21,9 @@ using Azure.Storage.Queues;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
 using OpenAI.Chat;
+using UglyToad.PdfPig;
+using UglyToad.PdfPig.Content;
+using UglyToad.PdfPig.Tokens;
 
 namespace InboundProcess
 {
@@ -195,6 +199,12 @@ namespace InboundProcess
             FunctionContext context) =>
             await ExecuteWorkflowStepAsync("translation", message, context, RunTranslationStepAsync);
 
+        [Function("WorkflowPdfImagesStep")]
+        public async Task WorkflowPdfImagesStep(
+            [QueueTrigger("%WORKFLOW_QUEUE_PDFIMAGES%", Connection = "AzureWebJobsStorage")] string message,
+            FunctionContext context) =>
+            await ExecuteWorkflowStepAsync("pdfimages", message, context, RunPdfImageExtractionStepAsync);
+
         [Function("WorkflowPiiStep")]
         public async Task WorkflowPiiStep(
             [QueueTrigger("%WORKFLOW_QUEUE_PII%", Connection = "AzureWebJobsStorage")] string message,
@@ -268,6 +278,7 @@ namespace InboundProcess
             var outputTypeFolder = "documentintelligence";
             var outputFileName = $"{originalFileName}_document_intelligence_output.json";
             var outputBlobPath = $"{outputTypeFolder}/{outputFileName}";
+            var documentId = BuildDocumentId(outputFileName);
 
             var containerClient = _blobServiceClient.GetBlobContainerClient(OutputContainerName);
             await containerClient.CreateIfNotExistsAsync(cancellationToken: cancellationToken);
@@ -275,6 +286,7 @@ namespace InboundProcess
 
             var docJson = JsonSerializer.Serialize(new
             {
+                document_id = documentId,
                 reference_id = diMessage.Workflow.ReferenceId,
                 processor = "document intelligence",
                 main_content = result.Content,
@@ -364,18 +376,24 @@ namespace InboundProcess
                 throw new InvalidOperationException($"Failed to read blob content: {ex.Message}");
             }
 
-            var lines = textContent.Split('\n');
-            if (lines.Length > 1)
+            var hasMainContent = TryExtractMainContent(textContent, out var mainContent) && !string.IsNullOrWhiteSpace(mainContent);
+            var translationInput = hasMainContent ? mainContent : textContent;
+            if (string.IsNullOrWhiteSpace(translationInput))
             {
-                textContent = string.Join("\n", lines.Skip(1));
+                throw new InvalidOperationException("No content available to translate");
             }
 
+            const int LanguageDetectionSampleLength = 4000; // stay under service limit (5120 text elements)
             var languageEndpoint = GetRequiredSetting("AI_LANGUAGE_ENDPOINT");
             var textAnalyticsClient = new TextAnalyticsClient(new Uri(languageEndpoint), new DefaultAzureCredential());
             string language;
             try
             {
-                var response = await textAnalyticsClient.DetectLanguageAsync(textContent, cancellationToken: cancellationToken);
+                var sampleLength = Math.Min(LanguageDetectionSampleLength, translationInput.Length);
+                var detectionSample = sampleLength == translationInput.Length
+                    ? translationInput
+                    : translationInput[..sampleLength];
+                var response = await textAnalyticsClient.DetectLanguageAsync(detectionSample, cancellationToken: cancellationToken);
                 language = response.Value.Iso6391Name;
             }
             catch (Exception ex)
@@ -383,32 +401,54 @@ namespace InboundProcess
                 throw new InvalidOperationException($"Failed to detect language: {ex.Message}");
             }
 
-            string translatedText = textContent;
+            string translatedText = translationInput;
             bool wasTranslated = false;
-            if (!string.Equals(language, "en", StringComparison.OrdinalIgnoreCase))
+            if (!string.Equals(language, "es", StringComparison.OrdinalIgnoreCase))
             {
+                const int TranslationChunkSize = 4000; // keep within Translator limits
                 var translationEndpoint = GetRequiredSetting("AI_TRANSLATOR_ENDPOINT");
                 var translationClient = new TextTranslationClient(new DefaultAzureCredential(), new Uri(translationEndpoint));
-                try
+                var translatedBuilder = new StringBuilder(translationInput.Length);
+                var chunkIndex = 0;
+
+                foreach (var chunk in SplitIntoChunks(translationInput, TranslationChunkSize))
                 {
-                    var translateResult = await translationClient.TranslateAsync(
-                        targetLanguage: "en",
-                        sourceLanguage: language,
-                        content: new[] { textContent },
-                        cancellationToken: cancellationToken);
-                    translatedText = string.Join("\n", translateResult.Value[0].Translations.Select(t => t.Text));
-                    wasTranslated = true;
+                    try
+                    {
+                        var translateResult = await translationClient.TranslateAsync(
+                            targetLanguage: "es",
+                            sourceLanguage: language,
+                            content: new[] { chunk },
+                            cancellationToken: cancellationToken);
+
+                        var translatedChunk = translateResult.Value
+                            .FirstOrDefault()?.Translations
+                            .FirstOrDefault()?.Text;
+
+                        if (string.IsNullOrWhiteSpace(translatedChunk))
+                        {
+                            throw new InvalidOperationException("Translation service returned an empty chunk");
+                        }
+
+                        translatedBuilder.Append(translatedChunk);
+                    }
+                    catch (Exception ex)
+                    {
+                        throw new InvalidOperationException($"Failed to translate text chunk {chunkIndex + 1}: {ex.Message}");
+                    }
+
+                    chunkIndex++;
                 }
-                catch (Exception ex)
-                {
-                    throw new InvalidOperationException($"Failed to translate text: {ex.Message}");
-                }
+
+                translatedText = translatedBuilder.ToString();
+                wasTranslated = true;
             }
 
             var originalFileName = Path.GetFileName(envelope.BlobPath);
             var outputTypeFolder = wasTranslated ? "translation" : "textpassthrough";
             var outputFileName = $"{originalFileName}_translated.json";
             var outputBlobPath = $"{outputTypeFolder}/{outputFileName}";
+            var documentId = BuildDocumentId(outputFileName);
 
             var containerClient = _blobServiceClient.GetBlobContainerClient(OutputContainerName);
             await containerClient.CreateIfNotExistsAsync(cancellationToken: cancellationToken);
@@ -416,6 +456,7 @@ namespace InboundProcess
 
             var outputJson = JsonSerializer.Serialize(new
             {
+                document_id = documentId,
                 reference_id = envelope.ReferenceId,
                 processor = wasTranslated ? "translation" : "text passthrough",
                 main_content = translatedText,
@@ -429,6 +470,113 @@ namespace InboundProcess
 
             envelope.Metadata[$"{outputTypeFolder}-output"] = outputBlobPath;
             await AdvanceWorkflowAsync(envelope, cancellationToken);
+        }
+
+        private async Task RunPdfImageExtractionStepAsync(WorkflowEnvelope envelope, CancellationToken cancellationToken)
+        {
+            var hasDownstream = envelope.RemainingSteps is { Count: > 0 };
+            var nextStep = hasDownstream ? envelope.RemainingSteps![0] : null;
+            var remainingAfterNext = hasDownstream ? envelope.RemainingSteps!.Skip(1).ToList() : new List<string>();
+
+            var blobClient = GetBlobClientForPath(envelope.BlobPath);
+            if (!blobClient.Name.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("PDF image extraction step requires a PDF input");
+            }
+
+            Stream pdfStream;
+            try
+            {
+                var download = await blobClient.DownloadAsync(cancellationToken: cancellationToken);
+                pdfStream = new MemoryStream();
+                await download.Value.Content.CopyToAsync(pdfStream, cancellationToken);
+                pdfStream.Position = 0;
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException($"Failed to download PDF for extraction: {ex.Message}");
+            }
+
+            List<ExtractedPdfImage> extractedImages;
+            try
+            {
+                extractedImages = ExtractPdfImages(pdfStream);
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException($"Failed to parse PDF for image extraction: {ex.Message}");
+            }
+            finally
+            {
+                pdfStream.Dispose();
+            }
+
+            if (extractedImages.Count == 0)
+            {
+                await PublishAlertAsync(envelope.BlobPath, envelope.ReferenceId, "PDF image extraction produced no images", cancellationToken);
+                return;
+            }
+
+            var referenceSegment = BuildDocumentId(envelope.ReferenceId ?? "reference");
+            var pdfSegment = BuildDocumentId(Path.GetFileNameWithoutExtension(blobClient.Name));
+            var containerClient = _blobServiceClient.GetBlobContainerClient(OutputContainerName);
+            await containerClient.CreateIfNotExistsAsync(cancellationToken: cancellationToken);
+
+            foreach (var image in extractedImages)
+            {
+                var imageBlobName = $"pdfimages/{referenceSegment}/{pdfSegment}-page{image.PageNumber:D4}-img{image.IndexOnPage:D4}{image.FileExtension}";
+                var outputBlobClient = containerClient.GetBlobClient(imageBlobName);
+
+                using (var imageStream = new MemoryStream(image.Bytes, writable: false))
+                {
+                    var uploadOptions = new BlobUploadOptions
+                    {
+                        HttpHeaders = new BlobHttpHeaders { ContentType = image.ContentType },
+                        Metadata = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                        {
+                            [ReferenceIdMetadataKey] = envelope.ReferenceId,
+                            ["source_pdf"] = envelope.BlobPath,
+                            ["source_page"] = image.PageNumber.ToString(CultureInfo.InvariantCulture),
+                            ["source_image_index"] = image.IndexOnPage.ToString(CultureInfo.InvariantCulture)
+                        }
+                    };
+
+                    await outputBlobClient.UploadAsync(imageStream, uploadOptions, cancellationToken);
+                }
+
+                var clonedMetadata = CloneMetadata(envelope.Metadata);
+                clonedMetadata["source-pdf"] = envelope.BlobPath;
+                clonedMetadata["source-pdf-page"] = image.PageNumber.ToString(CultureInfo.InvariantCulture);
+                clonedMetadata["source-pdf-image-index"] = image.IndexOnPage.ToString(CultureInfo.InvariantCulture);
+
+                if (hasDownstream && nextStep is not null)
+                {
+                    var downstreamEnvelope = new WorkflowEnvelope
+                    {
+                        ReferenceId = envelope.ReferenceId,
+                        BlobPath = $"{OutputContainerName}/{imageBlobName}",
+                        CurrentStep = nextStep,
+                        RemainingSteps = new List<string>(remainingAfterNext),
+                        Metadata = clonedMetadata
+                    };
+
+                    await EnqueueWorkflowAsync(downstreamEnvelope, cancellationToken);
+                }
+            }
+
+            _logger.LogInformation(
+                hasDownstream && nextStep is not null
+                    ? "Extracted {Count} images from {BlobPath} for reference {ReferenceId}; dispatched downstream step {NextStep}"
+                    : "Extracted {Count} images from {BlobPath} for reference {ReferenceId}; no downstream steps configured",
+                extractedImages.Count,
+                envelope.BlobPath,
+                envelope.ReferenceId,
+                nextStep ?? string.Empty);
+
+            if (hasDownstream)
+            {
+                await AdvanceWorkflowAsync(envelope, cancellationToken);
+            }
         }
 
         private async Task RunPiiStepAsync(WorkflowEnvelope envelope, CancellationToken cancellationToken)
@@ -507,9 +655,11 @@ namespace InboundProcess
             var outputFileName = $"{originalFileName}_pii_detection_result.json";
             var outputPath = $"{outputTypeFolder}/{outputFileName}";
             var resultBlobClient = containerClient.GetBlobClient(outputPath);
+            var documentId = BuildDocumentId(outputFileName);
 
             var outputJson = JsonSerializer.Serialize(new
             {
+                document_id = documentId,
                 reference_id = envelope.ReferenceId,
                 processor = "pii detection",
                 main_content = string.Join("\n", allResults.Select(r => ((dynamic)r).redactedText)),
@@ -554,6 +704,7 @@ namespace InboundProcess
             var outputTypeFolder = "aivision";
             var outputFileName = $"{Path.GetFileName(envelope.BlobPath)}_aivision_output.json";
             var outputBlobPath = $"{outputTypeFolder}/{outputFileName}";
+            var documentId = BuildDocumentId(outputFileName);
             var containerClient = _blobServiceClient.GetBlobContainerClient(OutputContainerName);
             await containerClient.CreateIfNotExistsAsync(cancellationToken: cancellationToken);
             var outputBlobClient = containerClient.GetBlobClient(outputBlobPath);
@@ -561,6 +712,7 @@ namespace InboundProcess
             var resultJson = JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
             var visionOutputJson = JsonSerializer.Serialize(new
             {
+                document_id = documentId,
                 reference_id = envelope.ReferenceId,
                 processor = "aivision",
                 main_content = string.Join(",", result.Value.Tags.Values.Select(t => $"{t.Name}:{t.Confidence}")),
@@ -612,6 +764,7 @@ namespace InboundProcess
             var originalFileName = Path.GetFileName(envelope.BlobPath);
             var outputFileName = $"{originalFileName}_gpt4ovision_output.json";
             var outputBlobPath = $"{outputTypeFolder}/{outputFileName}";
+            var documentId = BuildDocumentId(outputFileName);
 
             var containerClient = _blobServiceClient.GetBlobContainerClient(OutputContainerName);
             await containerClient.CreateIfNotExistsAsync(cancellationToken: cancellationToken);
@@ -619,6 +772,7 @@ namespace InboundProcess
 
             var outputJson = JsonSerializer.Serialize(new
             {
+                document_id = documentId,
                 reference_id = envelope.ReferenceId,
                 processor = "gpt4o vision",
                 main_content = result,
@@ -878,7 +1032,8 @@ namespace InboundProcess
                 ["pii"] = "workflow-pii",
                 ["translation"] = "workflow-translation",
                 ["aivision"] = "workflow-aivision",
-                ["gptvision"] = "workflow-gptvision"
+                ["gptvision"] = "workflow-gptvision",
+                ["pdfimages"] = "workflow-pdfimages"
             };
 
             foreach (var key in defaults.Keys.ToList())
@@ -894,6 +1049,30 @@ namespace InboundProcess
             return defaults;
         }
 
+        private static string BuildDocumentId(string fileName)
+        {
+            if (string.IsNullOrWhiteSpace(fileName))
+            {
+                return Guid.NewGuid().ToString("N");
+            }
+
+            var builder = new StringBuilder(fileName.Length);
+            foreach (var ch in fileName)
+            {
+                if (char.IsLetterOrDigit(ch) || ch == '_' || ch == '-' || ch == '=')
+                {
+                    builder.Append(ch);
+                }
+                else
+                {
+                    builder.Append('-');
+                }
+            }
+
+            var sanitized = builder.ToString().Trim('-');
+            return string.IsNullOrEmpty(sanitized) ? Guid.NewGuid().ToString("N") : sanitized;
+        }
+
         private static async Task UploadJsonAsync(BlobClient blobClient, string payload, CancellationToken cancellationToken)
         {
             using var ms = new MemoryStream(Encoding.UTF8.GetBytes(payload));
@@ -903,6 +1082,182 @@ namespace InboundProcess
             };
             await blobClient.UploadAsync(ms, uploadOptions, cancellationToken);
         }
+
+        private static Dictionary<string, string> CloneMetadata(IDictionary<string, string> metadata)
+        {
+            var clone = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (metadata is null)
+            {
+                return clone;
+            }
+
+            foreach (var pair in metadata)
+            {
+                if (!string.IsNullOrWhiteSpace(pair.Key) && pair.Value is not null)
+                {
+                    clone[pair.Key] = pair.Value;
+                }
+            }
+
+            return clone;
+        }
+
+        private static List<ExtractedPdfImage> ExtractPdfImages(Stream pdfStream)
+        {
+            var images = new List<ExtractedPdfImage>();
+            using var document = PdfDocument.Open(pdfStream, new ParsingOptions { UseLenientParsing = true });
+
+            foreach (var page in document.GetPages())
+            {
+                var pdfImages = page.GetImages();
+                if (pdfImages is null)
+                {
+                    continue;
+                }
+
+                var indexOnPage = 0;
+                foreach (var pdfImage in pdfImages)
+                {
+                    if (!TryMaterializePdfImage(pdfImage, out var imageBytes, out var contentType, out var fileExtension))
+                    {
+                        continue;
+                    }
+
+                    images.Add(new ExtractedPdfImage(imageBytes, page.Number, indexOnPage++, contentType, fileExtension));
+                }
+            }
+
+            return images;
+        }
+
+        private static bool TryExtractMainContent(string payload, out string mainContent)
+        {
+            mainContent = string.Empty;
+            if (string.IsNullOrWhiteSpace(payload))
+            {
+                return false;
+            }
+
+            try
+            {
+                using var document = JsonDocument.Parse(payload);
+                if (document.RootElement.TryGetProperty("main_content", out var mainContentProperty) &&
+                    mainContentProperty.ValueKind == JsonValueKind.String)
+                {
+                    mainContent = mainContentProperty.GetString() ?? string.Empty;
+                    return true;
+                }
+            }
+            catch (JsonException)
+            {
+                return false;
+            }
+
+            return false;
+        }
+
+        private static IEnumerable<string> SplitIntoChunks(string text, int chunkSize)
+        {
+            if (chunkSize <= 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(chunkSize));
+            }
+
+            for (var index = 0; index < text.Length; index += chunkSize)
+            {
+                yield return text.Substring(index, Math.Min(chunkSize, text.Length - index));
+            }
+        }
+
+        private static bool TryMaterializePdfImage(IPdfImage pdfImage, out byte[] bytes, out string contentType, out string fileExtension)
+        {
+            if (pdfImage.TryGetPng(out var pngBytes) && pngBytes is { Length: > 0 })
+            {
+                bytes = pngBytes;
+                contentType = "image/png";
+                fileExtension = ".png";
+                return true;
+            }
+
+            if (pdfImage.TryGetBytes(out var rawBytes) && rawBytes is { Count: > 0 })
+            {
+                bytes = rawBytes as byte[] ?? rawBytes.ToArray();
+                var filterName = ResolvePrimaryFilterName(pdfImage.ImageDictionary);
+                switch (filterName)
+                {
+                    case "DCTDecode":
+                    case "DCT":
+                        contentType = "image/jpeg";
+                        fileExtension = ".jpg";
+                        return true;
+                    case "JPXDecode":
+                        contentType = "image/jpx";
+                        fileExtension = ".jpx";
+                        return true;
+                    case "CCITTFaxDecode":
+                    case "CCITTFax":
+                        contentType = "image/tiff";
+                        fileExtension = ".tiff";
+                        return true;
+                    default:
+                        contentType = "application/octet-stream";
+                        fileExtension = ".img";
+                        return true;
+                }
+            }
+
+            if (pdfImage.RawBytes is { Count: > 0 } buffer)
+            {
+                bytes = buffer as byte[] ?? buffer.ToArray();
+                var filterName = ResolvePrimaryFilterName(pdfImage.ImageDictionary);
+                switch (filterName)
+                {
+                    case "DCTDecode" or "DCT":
+                        contentType = "image/jpeg";
+                        fileExtension = ".jpg";
+                        return true;
+                    case "JPXDecode":
+                        contentType = "image/jpx";
+                        fileExtension = ".jpx";
+                        return true;
+                    case "CCITTFaxDecode" or "CCITTFax":
+                        contentType = "image/tiff";
+                        fileExtension = ".tiff";
+                        return true;
+                    default:
+                        contentType = "application/octet-stream";
+                        fileExtension = ".img";
+                        return true;
+                }
+            }
+
+            bytes = Array.Empty<byte>();
+            contentType = string.Empty;
+            fileExtension = string.Empty;
+            return false;
+        }
+
+        private static string ResolvePrimaryFilterName(DictionaryToken dictionary)
+        {
+            if (dictionary is null)
+            {
+                return string.Empty;
+            }
+
+            if (dictionary.TryGet(NameToken.Filter, out var filterToken))
+            {
+                return filterToken switch
+                {
+                    NameToken name => name.Data,
+                    ArrayToken array => array.Data.OfType<NameToken>().FirstOrDefault()?.Data ?? string.Empty,
+                    _ => string.Empty
+                };
+            }
+
+            return string.Empty;
+        }
+
+        private sealed record ExtractedPdfImage(byte[] Bytes, int PageNumber, int IndexOnPage, string ContentType, string FileExtension);
 
     }
 }

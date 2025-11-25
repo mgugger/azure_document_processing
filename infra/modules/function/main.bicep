@@ -149,6 +149,10 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
           value: 'workflow-gptvision'
         }
         {
+          name: 'WORKFLOW_QUEUE_PDFIMAGES'
+          value: 'workflow-pdfimages'
+        }
+        {
           name: 'WORKFLOW_ALERT_QUEUE'
           value: 'workflow-alerts'
         }

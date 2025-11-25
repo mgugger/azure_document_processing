@@ -68,6 +68,10 @@ resource workflowGptVisionQueue 'Microsoft.Storage/storageAccounts/queueServices
   name: '${storageAccount.name}/default/workflow-gptvision'
 }
 
+resource workflowPdfImagesQueue 'Microsoft.Storage/storageAccounts/queueServices/queues@2022-09-01' = {
+  name: '${storageAccount.name}/default/workflow-pdfimages'
+}
+
 resource workflowAlertsQueue 'Microsoft.Storage/storageAccounts/queueServices/queues@2022-09-01' = {
   name: '${storageAccount.name}/default/workflow-alerts'
 }

@@ -22,6 +22,7 @@
       <PackageReference Include="Azure.AI.Vision.ImageAnalysis" Version="1.0.0" />
   <PackageReference Include="Azure.AI.Translation.Text" Version="1.0.0" />
   <PackageReference Include="Azure.AI.OpenAI" Version="2.1.0" />
+  <PackageReference Include="UglyToad.PdfPig" Version="1.7.0-custom-5" />
   </ItemGroup>
 
   <ItemGroup>

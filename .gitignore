@@ -6,3 +6,4 @@ obj
 release
 bin
 .vscode
+*.pdf

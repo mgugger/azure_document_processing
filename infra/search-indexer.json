@@ -6,6 +6,7 @@
     "interval": "PT5M"
   },
   "parameters": {
+    "base64EncodeKeys": false,
     "maxFailedItems": 0,
     "maxFailedItemsPerBatch": 0,
     "configuration": {
